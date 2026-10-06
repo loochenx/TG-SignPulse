@@ -374,6 +374,13 @@ class TelegramService:
                 "user_id": getattr(me, "id", None),
             }
         except asyncio.TimeoutError:
+            set_account_status(
+                account_name,
+                status="checking",
+                message="Request timed out",
+                code="TIMEOUT",
+                needs_relogin=False,
+            )
             return {
                 "account_name": account_name,
                 "ok": False,
@@ -403,6 +410,13 @@ class TelegramService:
                     "checked_at": checked_at,
                     "needs_relogin": True,
                 }
+            set_account_status(
+                account_name,
+                status="checking",
+                message=err_text,
+                code="CONNECTION_ERROR",
+                needs_relogin=False,
+            )
             return {
                 "account_name": account_name,
                 "ok": False,

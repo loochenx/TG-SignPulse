@@ -41,14 +41,7 @@ jobs:
 
   # ── main / tag: full multi-arch build + push (skip docs-only changes) ───────
   build-and-push:
-    if: >
-      github.event_name != 'pull_request' && (
-        github.event_name == 'workflow_dispatch' ||
-        startsWith(github.ref, 'refs/tags/') ||
-        !contains(toJson(github.event.commits.*.modified), 'README') &&
-        !contains(toJson(github.event.commits.*.added), 'README') ||
-        github.event_name == 'push'
-      )
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     outputs:
       skip: ${{ steps.changed.outputs.skip }}

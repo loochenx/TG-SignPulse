@@ -75,8 +75,8 @@ RUN pip install --no-cache-dir --no-deps .
 FROM python:3.12-slim AS app
 
 # Build-time version metadata (injected by CI via --build-arg).
-ARG BUILD_DATE=""
-ARG BUILD_SHA=""
+ARG BUILD_DATE="unknown"
+ARG BUILD_SHA="dev"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

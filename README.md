@@ -110,6 +110,7 @@ touch /data/.probe && rm /data/.probe
 - `APP_DATA_DIR`: 自定义数据目录（优先级高于面板配置）
 - `TG_PROXY`: Telegram 连接代理；也可在面板设置全局代理
 - `TG_SESSION_MODE`: `file`（默认）或 `string`（arm64 推荐）
+- `TG_LOGIN_GET_ME_TIMEOUT`: 签到登录身份确认的最长等待秒数，默认 `12`；超时后任务会按有限次数重试
 - `TG_SESSION_NO_UPDATES`: `1` 启用 `no_updates`（仅 `string` 模式）
 - `TG_GLOBAL_CONCURRENCY`: 全局并发（默认 `1`）
 - `APP_TOTP_VALID_WINDOW`: 面板 2FA 容错窗口

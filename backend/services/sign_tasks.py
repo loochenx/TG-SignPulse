@@ -941,7 +941,8 @@ class SignTaskService:
         account_name: str,
         task_name: str,
         no_updates: bool,
-    ) -> str | None:
+    ) -> tuple[str, str | None]:
+        """返回 (状态, 信息)：ok、invalid 或 transient。"""
         stored_status = get_account_status(account_name)
         if stored_status.get("status") == "invalid" and stored_status.get(
             "needs_relogin"
@@ -951,7 +952,7 @@ class SignTaskService:
                 or f"账号 {account_name} 登录已失效，请重新登录"
             )
             await self._mark_account_invalid(account_name, task_name, message)
-            return message
+            return "invalid", message
 
         try:
             from backend.services.telegram import get_telegram_service
@@ -961,34 +962,50 @@ class SignTaskService:
                 timeout_seconds=10.0,
                 no_updates=no_updates,
             )
-        except Exception as e:
+        except Exception as exc:
             logging.getLogger("backend.sign_tasks").warning(
                 "Account status check failed before task %s/%s: %s",
                 account_name,
                 task_name,
-                e,
+                exc,
             )
-            return None
+            return "transient", str(exc) or "账号连接检查失败"
 
         if result.get("ok"):
-            return None
+            return "ok", None
 
         needs_relogin = bool(result.get("needs_relogin"))
         status = str(result.get("status") or "")
         code = str(result.get("code") or "")
+        message = str(result.get("message") or "").strip()
         if (
             needs_relogin
             or status in {"invalid", "not_found"}
             or code == "ACCOUNT_SESSION_INVALID"
         ):
-            message = (
-                str(result.get("message") or "").strip()
-                or f"账号 {account_name} 登录已失效，请重新登录"
-            )
+            message = message or f"账号 {account_name} 登录已失效，请重新登录"
             await self._mark_account_invalid(account_name, task_name, message)
-            return message
+            return "invalid", message
 
-        return None
+        # TIMEOUT / CONNECTION_ERROR 等临时状态不再继续执行签到；否则会在
+        # Pyrogram 内部等待很久，并把短时网络波动放大为所有任务连续失败。
+        return "transient", message or "Telegram 连接暂时不可用"
+
+    @staticmethod
+    def _is_transient_network_error(exc: Exception) -> bool:
+        if isinstance(exc, (OSError, asyncio.TimeoutError)):
+            return True
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "request timed out",
+                "connection reset",
+                "connection aborted",
+                "network is unreachable",
+                "temporary failure",
+            )
+        )
 
     def list_tasks(
         self, account_name: str | None = None, force_refresh: bool = False
@@ -1823,17 +1840,24 @@ class SignTaskService:
             has_keyword_monitor = self._task_has_keyword_monitor(task_cfg)
             signer_no_updates = not requires_updates
 
-            invalid_reason = await self._check_account_before_task(
+            precheck_state, precheck_message = await self._check_account_before_task(
                 account_name,
                 task_name,
                 no_updates=signer_no_updates,
             )
-            if invalid_reason:
+            if precheck_state == "invalid":
                 account_invalid_detected = True
                 error_msg = (
-                    f"账号 {account_name} 登录已失效，请重新登录: {invalid_reason}"
+                    f"账号 {account_name} 登录已失效，请重新登录: {precheck_message}"
                 )
                 self._active_logs[task_key].append(error_msg)
+            elif precheck_state == "transient":
+                error_msg = (
+                    f"Telegram 连接异常，本次未执行签到，将按计划重试: "
+                    f"{precheck_message}"
+                )
+                self._active_logs[task_key].append(error_msg)
+                logger.warning("%s/%s", account_name, error_msg)
             else:
                 if has_keyword_monitor:
                     try:
@@ -1944,14 +1968,24 @@ class SignTaskService:
                                 await signer.run_once(num_of_dialogs=20)
                                 break
                             except Exception as e:
+                                is_locked = "database is locked" in str(e).lower()
+                                is_network_error = self._is_transient_network_error(e)
                                 if (
-                                    "database is locked" in str(e).lower()
-                                    and attempt < max_retries - 1
-                                ):
+                                    is_locked or is_network_error
+                                ) and attempt < max_retries - 1:
                                     delay = (attempt + 1) * 3
-                                    self._active_logs[task_key].append(
-                                        f"Session 被锁定，{delay} 秒后重试..."
-                                    )
+                                    if is_network_error:
+                                        from tg_signer.core import close_client_by_name
+
+                                        await close_client_by_name(
+                                            account_name, workdir=session_dir
+                                        )
+                                        message = (
+                                            f"Telegram 连接异常，{delay} 秒后重试..."
+                                        )
+                                    else:
+                                        message = f"Session 被锁定，{delay} 秒后重试..."
+                                    self._active_logs[task_key].append(message)
                                     await asyncio.sleep(delay)
                                     continue
                                 raise

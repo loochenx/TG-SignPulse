@@ -628,8 +628,13 @@ class BaseUserWorker(Generic[ConfigT]):
     async def login(self, num_of_dialogs=20, print_chat=True):
         self.log("开始登录...")
         app = self.app
+        login_timeout = _read_positive_float_env(
+            "TG_LOGIN_GET_ME_TIMEOUT", 12.0, minimum=3.0
+        )
         async with app:
-            me = await app.get_me()
+            # Pyrogram 自身的请求重试在网络异常时可能等待数分钟。签到前的
+            # 身份确认只需要一个有限时间窗口，超时后交给任务层做有限重试。
+            me = await asyncio.wait_for(app.get_me(), timeout=login_timeout)
             self.set_me(me)
             latest_chats = []
             try:
@@ -1373,8 +1378,12 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
                         if started_here:
                             await self.app.stop()
 
-                except (OSError, errors.Unauthorized):
+                except OSError:
                     logger.exception("运行异常")
+                    # run_once 是一次性任务。网络错误必须交还给任务服务处理，
+                    # 不能在持有账号锁和全局并发槽位时无限循环。
+                    if only_once:
+                        raise
                     await asyncio.sleep(30)
                     continue
 

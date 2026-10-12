@@ -26,6 +26,7 @@ from backend.utils.docker_api import (
     DockerError,
     docker_host,
     image_defaults,
+    split_image_ref,
 )
 
 logger = logging.getLogger("backend.self_update")
@@ -175,6 +176,15 @@ class SelfUpdateService:
         resp.raise_for_status()
         return latest_version_from_tags([item.get("name", "") for item in resp.json()])
 
+    @staticmethod
+    def _release_image_ref(image_ref: str, version: str | None) -> str:
+        """latest 优先解析为数字版本标签，避开镜像加速服务的旧 latest 缓存。"""
+        repo, tag, digest = split_image_ref(image_ref)
+        parsed = parse_version(version)
+        if tag == "latest" and not digest and parsed:
+            return f"{repo}:{'.'.join(str(part) for part in parsed)}"
+        return image_ref
+
     def _run_check(self, client: DockerClient | None, container: dict | None) -> dict:
         current = current_build()
         result: dict[str, Any] = {
@@ -191,14 +201,29 @@ class SelfUpdateService:
 
         newer = None
         latest = parse_version(result["latest_version"])
-        if latest and parse_version(current["version"]):
-            newer = latest > parse_version(current["version"])  # type: ignore[operator]
+        installed = parse_version(current["version"])
+        if latest and installed:
+            newer = latest > installed
 
         if client and container:
             image_ref = container["Config"]["Image"]
+            # 当前版本更高或暂时读不到 GitHub 时，用当前数字版本核对，避免
+            # 旧 latest 缓存被误认为新镜像，导致再次更新甚至降级。
+            release_version = result["latest_version"]
+            if not latest or (installed and latest < installed):
+                release_version = current["version"]
+            result["pull_ref"] = self._release_image_ref(image_ref, release_version)
             try:
                 try:
-                    remote = client.remote_digest(image_ref)
+                    try:
+                        remote = client.remote_digest(result["pull_ref"])
+                    except DockerError as exc:
+                        if exc.status != 404 or result["pull_ref"] == image_ref:
+                            raise
+                        # 自定义镜像可能没有数字标签；发布标签先于镜像就绪时，
+                        # 同样回退到原标签，以实际镜像摘要决定是否可以安装。
+                        result["pull_ref"] = image_ref
+                        remote = client.remote_digest(image_ref)
                     self._unpullable = None
                 except DockerError as exc:
                     if exc.status in _REGISTRY_REFUSED:
@@ -365,9 +390,15 @@ class SelfUpdateService:
         image_ref = container["Config"]["Image"]
         try:
             old_image = self._old_image_defaults(client, container)
-            logger.info("一键更新：拉取 %s", image_ref)
+            with self._lock:
+                check = self._check
+                stale = time.monotonic() - self._checked_at_mono > CHECK_TTL_SECONDS
+            if not _env_off("APP_UPDATE_CHECK") and (check is None or stale):
+                check = self._run_check(client, container)
+            pull_ref = (check or {}).get("pull_ref") or image_ref
+            logger.info("一键更新：拉取 %s", pull_ref)
             try:
-                client.pull(image_ref)
+                client.pull(pull_ref)
             except DockerError as exc:
                 if exc.status not in _REGISTRY_REFUSED:
                     raise
@@ -375,7 +406,23 @@ class SelfUpdateService:
                 self._unpullable = image_ref
                 self._set_job("failed", str(exc), code="not_pullable")
                 return
-            new_image = client.inspect_image(image_ref)
+            new_image = client.inspect_image(pull_ref)
+            labels = (new_image.get("Config") or {}).get("Labels") or {}
+            downloaded = parse_version(labels.get("org.opencontainers.image.version"))
+            installed = parse_version(current_build()["version"])
+            if downloaded and installed and downloaded < installed:
+                # 禁用检查更新或仓库回退时，也不能把旧缓存安装为新版本。
+                client.tag_image(container["Image"], image_ref)
+                self._set_job(
+                    "failed",
+                    "镜像仓库返回了较旧版本，请稍后重新检查",
+                    code="older_version",
+                )
+                return
+            if pull_ref != image_ref:
+                # 更新助手与 compose 都继续使用原标签，确保重启仍指向新镜像，
+                # 后续更新也能继续选择新的数字版本。
+                client.tag_image(new_image["Id"], image_ref)
             if new_image["Id"] == container["Image"]:
                 logger.info("一键更新：镜像没有变化")
                 with self._lock:

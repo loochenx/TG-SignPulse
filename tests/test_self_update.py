@@ -193,6 +193,7 @@ class FakeDocker:
                 "RepoDigests": OLD_IMAGE["RepoDigests"],
             },
         }
+        self.remote_digests = {"luochend/tg-signpulse:latest": "sha256:old"}
         self.new_image_id = new_image_id
         self.fail_start = fail_start
         self.created = []
@@ -209,6 +210,16 @@ class FakeDocker:
         if ref not in self.images:
             raise DockerError(404, "no such image")
         return self.images[ref]
+
+    def remote_digest(self, ref):
+        if ref not in self.remote_digests:
+            raise DockerError(404, "manifest unknown")
+        return self.remote_digests[ref]
+
+    def tag_image(self, source, target):
+        image = next(image for image in self.images.values() if image["Id"] == source)
+        self.images[target] = dict(image)
+        self._log("tag", source, target)
 
     def pull(self, ref, on_progress=None):
         self._log("pull", ref)
@@ -742,3 +753,175 @@ def test_status_route(api, service, monkeypatch):
     body = client.get("/api/update/status").json()
     assert body["current"]["version"] == "0.9.0"
     assert body["job"]["state"] == "idle"
+
+
+# ── 数字版本镜像与加速缓存 ──────────────────────────────────────────────
+
+
+def test_stale_latest_does_not_hide_release(service, monkeypatch):
+    docker = FakeDocker()
+    docker.remote_digests["luochend/tg-signpulse:0.9.2"] = "sha256:new"
+    docker.list_containers = lambda label: []
+    monkeypatch.setattr(
+        service, "_docker", lambda: (docker, docker.containers[OLD_ID], None)
+    )
+
+    status = service.status()
+
+    assert status["update_available"] is True
+    assert status["latest_version"] == "0.9.2"
+    assert service._check["pull_ref"] == "luochend/tg-signpulse:0.9.2"
+
+
+def test_release_already_installed_ignores_stale_latest(service, monkeypatch):
+    from backend.services import self_update
+
+    monkeypatch.setattr(self_update, "current_build", lambda: {"version": "0.9.2"})
+    docker = FakeDocker()
+    docker.remote_digests["luochend/tg-signpulse:0.9.2"] = "sha256:new"
+    docker.images[OLD_IMAGE_ID] = {
+        **OLD_IMAGE,
+        "RepoDigests": ["luochend/tg-signpulse@sha256:new"],
+    }
+    docker.list_containers = lambda label: []
+    monkeypatch.setattr(
+        service, "_docker", lambda: (docker, docker.containers[OLD_ID], None)
+    )
+
+    assert service.status()["update_available"] is False
+
+
+def test_unpublished_release_does_not_offer_old_latest(service, monkeypatch):
+    docker = FakeDocker()
+    docker.list_containers = lambda label: []
+    monkeypatch.setattr(
+        service, "_docker", lambda: (docker, docker.containers[OLD_ID], None)
+    )
+
+    assert service.status()["update_available"] is False
+    assert service._check["pull_ref"] == "luochend/tg-signpulse:latest"
+
+
+def test_apply_downloads_release_and_preserves_latest_alias(service, monkeypatch):
+    docker = FakeDocker()
+    docker.remote_digests["luochend/tg-signpulse:0.9.2"] = "sha256:new"
+    monkeypatch.setattr(
+        service, "_docker", lambda: (docker, docker.containers[OLD_ID], None)
+    )
+
+    service.apply()
+    assert _wait_job(service, states=("pulling",))["state"] == "restarting"
+    assert ("pull", "luochend/tg-signpulse:0.9.2") in docker.calls
+    assert ("pull", "luochend/tg-signpulse:latest") not in docker.calls
+    assert ("tag", NEW_IMAGE_ID, "luochend/tg-signpulse:latest") in docker.calls
+    assert docker.images["luochend/tg-signpulse:latest"]["Id"] == NEW_IMAGE_ID
+    assert docker.created[0][1]["Cmd"] == [OLD_ID, "luochend/tg-signpulse:latest"]
+
+
+def test_newer_installed_release_does_not_downgrade(service, monkeypatch):
+    from backend.services import self_update
+
+    monkeypatch.setattr(self_update, "current_build", lambda: {"version": "0.9.3"})
+    docker = FakeDocker()
+    docker.remote_digests["luochend/tg-signpulse:0.9.3"] = "sha256:old"
+    docker.list_containers = lambda label: []
+    monkeypatch.setattr(
+        service, "_docker", lambda: (docker, docker.containers[OLD_ID], None)
+    )
+
+    assert service.status()["update_available"] is False
+    assert service._check["pull_ref"] == "luochend/tg-signpulse:0.9.3"
+
+
+def test_custom_image_tag_is_kept(service):
+    assert (
+        service._release_image_ref("registry:5000/app:stable", "0.9.2")
+        == "registry:5000/app:stable"
+    )
+    assert (
+        service._release_image_ref("registry:5000/app:latest", "0.9.2")
+        == "registry:5000/app:0.9.2"
+    )
+
+
+def test_tag_image_sends_docker_tag_request():
+    import httpx
+
+    from backend.utils.docker_api import DockerClient
+
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(201)
+
+    client = DockerClient("tcp://docker.example:2375")
+    client._client.close()
+    client._client = httpx.Client(
+        base_url="http://docker.example:2375", transport=httpx.MockTransport(handle)
+    )
+    try:
+        client.tag_image("sha256:new", "registry:5000/owner/app:latest")
+        assert len(requests) == 1
+        assert requests[0].method == "POST"
+        assert requests[0].url.path == "/images/sha256:new/tag"
+        assert requests[0].url.params["repo"] == "registry:5000/owner/app"
+        assert requests[0].url.params["tag"] == "latest"
+    finally:
+        client.close()
+
+
+def test_numeric_image_network_failure_keeps_numeric_download(service, monkeypatch):
+    docker = FakeDocker()
+
+    def digest(ref):
+        if ref.endswith(":0.9.2"):
+            raise DockerError(500, "registry unavailable")
+        return "sha256:old"
+
+    docker.remote_digest = digest
+    docker.list_containers = lambda label: []
+    monkeypatch.setattr(
+        service, "_docker", lambda: (docker, docker.containers[OLD_ID], None)
+    )
+    status = service.status()
+    assert status["check_error"] == "registry unavailable"
+    assert service._check["pull_ref"] == "luochend/tg-signpulse:0.9.2"
+
+
+def test_apply_repairs_alias_when_release_is_already_running(service, monkeypatch):
+    docker = FakeDocker(new_image_id=OLD_IMAGE_ID)
+    docker.remote_digests["luochend/tg-signpulse:0.9.2"] = "sha256:old"
+    monkeypatch.setattr(
+        service, "_docker", lambda: (docker, docker.containers[OLD_ID], None)
+    )
+    service.apply()
+    assert _wait_job(service)["state"] == "up_to_date"
+    assert ("tag", OLD_IMAGE_ID, "luochend/tg-signpulse:latest") in docker.calls
+    assert docker.created == []
+
+
+def test_apply_refuses_older_cached_image(service, monkeypatch):
+    from backend.services import self_update
+
+    monkeypatch.setattr(self_update, "current_build", lambda: {"version": "0.9.3"})
+    monkeypatch.setenv("APP_UPDATE_CHECK", "0")
+    docker = FakeDocker()
+    original_pull = docker.pull
+
+    def old_cached_pull(ref, on_progress=None):
+        original_pull(ref)
+        docker.images[ref]["Config"] = {
+            "Labels": {"org.opencontainers.image.version": "0.9.1"}
+        }
+
+    docker.pull = old_cached_pull
+    monkeypatch.setattr(
+        service, "_docker", lambda: (docker, docker.containers[OLD_ID], None)
+    )
+    service.apply()
+    job = _wait_job(service)
+    assert job["state"] == "failed"
+    assert job["code"] == "older_version"
+    assert docker.created == []
+    assert docker.images["luochend/tg-signpulse:latest"]["Id"] == OLD_IMAGE_ID

@@ -232,6 +232,16 @@ class DockerClient:
                 if on_progress:
                     on_progress(event)
 
+    def tag_image(self, source: str, target: str) -> None:
+        repo, tag, digest = split_image_ref(target)
+        if digest or tag is None:
+            raise ValueError("镜像别名必须是标签，不能是固定摘要")
+        self._request(
+            "POST",
+            f"/images/{quote(source, safe='/:@')}/tag",
+            params={"repo": repo, "tag": tag},
+        )
+
     def remove_image(self, ref: str) -> None:
         self._request("DELETE", f"/images/{quote(ref, safe='/:@')}")
 

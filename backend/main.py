@@ -110,7 +110,6 @@ def get_version() -> dict[str, str]:
     # BUILD_DATE and BUILD_SHA are injected at Docker build time via ARG→ENV.
     # Falls back to git log for local dev (when .git is present).
     built_at = os.environ.get("BUILD_DATE", "")
-    build_sha = os.environ.get("BUILD_SHA", "")
 
     if not built_at:
         import shutil
@@ -126,11 +125,7 @@ def get_version() -> dict[str, str]:
             except Exception:
                 pass
 
-    version_str = __version__
-    if build_sha:
-        version_str = f"{__version__} ({build_sha})"
-
-    return {"version": version_str, "built_at": built_at}
+    return {"version": __version__, "built_at": built_at}
 
 
 @app.get("/readyz")

@@ -296,7 +296,7 @@ export function UpdateSheet({ open, t, language, onClose }: { open: boolean; t: 
           <div className="min-w-0 flex-1">
             <p className="text-headline">TG SignPulse</p>
             <p className="num mt-0.5 truncate text-footnote text-label-2">
-              {current ? `v${current.version}${current.build_sha ? ` · ${current.build_sha.slice(0, 7)}` : ""}` : "—"}
+              {current ? `v${current.version}` : "—"}
             </p>
             {current?.built_at ? (
               <p className="num truncate text-footnote text-label-3">

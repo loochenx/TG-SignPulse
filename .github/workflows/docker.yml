@@ -50,6 +50,22 @@ jobs:
         with:
           fetch-depth: 2
 
+      - name: Validate release version
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          import re
+          import runpy
+
+          version = runpy.run_path("tg_signer/__init__.py")["__version__"]
+          if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+              raise SystemExit("程序版本必须使用数字版本号 x.y.z")
+          if os.environ["GITHUB_REF_TYPE"] == "tag":
+              if os.environ["GITHUB_REF_NAME"] != f"v{version}":
+                  raise SystemExit("发布标签必须与程序版本一致")
+          print(f"Release version: {version}")
+          PYTHON
+
       - name: Check if only docs changed
         id: changed
         run: |

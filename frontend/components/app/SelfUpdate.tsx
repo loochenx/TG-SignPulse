@@ -30,7 +30,7 @@ interface SelfUpdateValue {
 const SelfUpdateContext = createContext<SelfUpdateValue | undefined>(undefined);
 
 const POLL_MS = 2000;
-const GIVE_UP_MS = 6 * 60_000;
+const GIVE_UP_MS = 20 * 60_000;
 // 新面板起来后，助手还要清理旧容器才退出，最多等这么久拿它的结果
 const RESULT_WAIT_MS = 30_000;
 const DONE_FLAG = "tg-update-done";
@@ -84,6 +84,7 @@ export function SelfUpdateProvider({ children }: { children: ReactNode }) {
         }
         if (s.job.state === "pulling") {
           setPhase("pulling");
+          setDetail(s.job.message);
         } else if (s.job.state === "up_to_date") {
           return finish("up_to_date");
         } else if (s.job.state === "failed") {

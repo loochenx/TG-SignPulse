@@ -26,6 +26,7 @@ from backend.utils.docker_api import (
     DockerError,
     docker_host,
     image_defaults,
+    retryable_pull_error,
     split_image_ref,
 )
 
@@ -397,10 +398,27 @@ class SelfUpdateService:
                 check = self._run_check(client, container)
             pull_ref = (check or {}).get("pull_ref") or image_ref
             logger.info("一键更新：拉取 %s", pull_ref)
+
+            def progress(event: dict) -> None:
+                if event.get("message"):
+                    logger.info("一键更新：%s", event["message"])
+                    self._set_job("pulling", str(event["message"]))
+
             try:
-                client.pull(pull_ref)
-            except DockerError as exc:
-                if exc.status not in _REGISTRY_REFUSED:
+                client.pull(pull_ref, on_progress=progress)
+            except (DockerError, httpx.TransportError) as exc:
+                if retryable_pull_error(exc):
+                    logger.exception("一键更新：下载重试后仍失败")
+                    self._set_job(
+                        "failed",
+                        "镜像下载连接中断，自动重试后仍未成功，请稍后重试",
+                        code="download_interrupted",
+                    )
+                    return
+                if (
+                    not isinstance(exc, DockerError)
+                    or exc.status not in _REGISTRY_REFUSED
+                ):
                     raise
                 logger.warning("一键更新：镜像仓库拒绝拉取 %s：%s", image_ref, exc)
                 self._unpullable = image_ref

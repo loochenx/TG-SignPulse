@@ -9,10 +9,12 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import struct
+import time
 from collections.abc import Callable
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -38,6 +40,67 @@ class DockerError(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
+
+
+def retryable_pull_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if not isinstance(exc, DockerError):
+        return False
+    if exc.status == 429:
+        return True
+    if exc.status not in (408, 500, 502, 503, 504):
+        return False
+    message = str(exc).lower()
+    return any(
+        word in message
+        for word in (
+            "eof",
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection refused",
+            "connection closed",
+            "tls handshake",
+            "temporary failure",
+            "no such host",
+            "network is unreachable",
+            "context deadline exceeded",
+            "service unavailable",
+            "bad gateway",
+            "gateway timeout",
+            "toomanyrequests",
+        )
+    )
+
+
+def registry_mirror_refs(ref: str, mirrors: list[str], digest: str) -> list[str]:
+    """只使用 Docker 已配置的 Hub 加速源，并固定为检查到的镜像摘要。"""
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        return []
+    repo, _, _ = split_image_ref(ref)
+    first, separator, remainder = repo.partition("/")
+    if first in ("docker.io", "index.docker.io", "registry-1.docker.io"):
+        repo = remainder
+    elif separator and ("." in first or ":" in first or first == "localhost"):
+        return []
+    if "/" not in repo:
+        repo = "library/" + repo
+    refs = []
+    for mirror in mirrors:
+        url = urlsplit(mirror)
+        if (
+            url.scheme not in ("https", "http")
+            or not url.netloc
+            or url.username
+            or url.password
+            or url.path not in ("", "/")
+            or url.query
+            or url.fragment
+        ):
+            continue
+        refs.append(f"{url.netloc}/{repo}@{digest}")
+    return list(dict.fromkeys(refs))
 
 
 def docker_host() -> str:
@@ -211,6 +274,55 @@ class DockerClient:
     # ── 镜像 ──
 
     def pull(self, ref: str, on_progress: Callable[[dict], None] | None = None) -> None:
+        """只重试临时下载错误；完成下载之前不改变容器或原有镜像标签。"""
+        mirrors: list[str] = []
+        source = ref
+        primary_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                self._pull_once(source, on_progress)
+                if source != ref:
+                    image = self.inspect_image(source)
+                    self.tag_image(image["Id"], ref)
+                return
+            except (DockerError, httpx.TransportError) as exc:
+                # 加速源没有此镜像时仍可回到原仓库；原仓库的权限/标签错误不重试。
+                mirror_refused = (
+                    source != ref
+                    and isinstance(exc, DockerError)
+                    and exc.status in (401, 403, 404)
+                )
+                if attempt == 2 or not (retryable_pull_error(exc) or mirror_refused):
+                    if mirror_refused and primary_error:
+                        raise primary_error
+                    raise
+                if attempt == 0:
+                    primary_error = exc
+                    try:
+                        digest = self.remote_digest(ref)
+                        info = self._request("GET", "/info").json()
+                        mirrors = registry_mirror_refs(
+                            ref,
+                            (info.get("RegistryConfig") or {}).get("Mirrors") or [],
+                            digest,
+                        )
+                    except (DockerError, httpx.HTTPError, KeyError, ValueError):
+                        # 加速源查询失败不会中止对原仓库的有限重试。
+                        mirrors = []
+                source = (
+                    ref
+                    if mirror_refused or not mirrors
+                    else mirrors[(attempt) % len(mirrors)]
+                )
+                if on_progress:
+                    on_progress(
+                        {"message": f"下载连接中断，正在重试（{attempt + 2}/3）"}
+                    )
+                time.sleep(2 * (attempt + 1))
+
+    def _pull_once(
+        self, ref: str, on_progress: Callable[[dict], None] | None = None
+    ) -> None:
         repo, tag, digest = split_image_ref(ref)
         params = {"fromImage": repo, "tag": digest or tag}
         timeout = httpx.Timeout(20, read=900)
@@ -220,6 +332,7 @@ class DockerClient:
             if resp.status_code >= 400:
                 resp.read()
                 raise DockerError(resp.status_code, resp.text.strip())
+            completed = False
             for line in resp.iter_lines():
                 if not line.strip():
                     continue
@@ -229,8 +342,14 @@ class DockerClient:
                     continue
                 if event.get("error"):
                     raise DockerError(500, str(event["error"]))
+                if str(event.get("status", "")).startswith(
+                    ("Status: Downloaded newer image", "Status: Image is up to date")
+                ):
+                    completed = True
                 if on_progress:
                     on_progress(event)
+            if not completed:
+                raise DockerError(500, "unexpected EOF: image download did not finish")
 
     def tag_image(self, source: str, target: str) -> None:
         repo, tag, digest = split_image_ref(target)

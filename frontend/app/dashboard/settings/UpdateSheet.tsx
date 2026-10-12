@@ -132,7 +132,7 @@ function Progress({ phase, detail, pullDenied, t }: { phase: UpdatePhase; detail
         <Step
           state={stateOf(0)}
           title={t("update_step_pull")}
-          note={phase === "failed" ? detail || t(pullDenied ? "update_pull_denied" : "update_start_failed") : undefined}
+          note={phase === "failed" ? detail || t(pullDenied ? "update_pull_denied" : "update_start_failed") : phase === "pulling" ? detail : undefined}
         />
         <Step state={stateOf(1)} title={t("update_step_restart")} note={restartNote} />
         <Step

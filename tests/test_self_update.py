@@ -925,3 +925,226 @@ def test_apply_refuses_older_cached_image(service, monkeypatch):
     assert job["code"] == "older_version"
     assert docker.created == []
     assert docker.images["luochend/tg-signpulse:latest"]["Id"] == OLD_IMAGE_ID
+
+
+# ── 下载中断恢复 ──────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def pull_client(monkeypatch):
+    import httpx
+
+    from backend.utils import docker_api
+
+    monkeypatch.setattr(docker_api.time, "sleep", lambda seconds: None)
+    client = docker_api.DockerClient("tcp://docker.example:2375")
+    client._client.close()
+    calls = []
+
+    def configure(handler):
+        def handle(request):
+            calls.append(request)
+            return handler(request)
+
+        client._client = httpx.Client(
+            base_url="http://docker.example:2375", transport=httpx.MockTransport(handle)
+        )
+        return client, calls
+
+    yield configure
+    client.close()
+
+
+def test_pull_recovers_from_eof_stream(pull_client):
+    import httpx
+
+    attempts = []
+
+    def handle(request):
+        if request.url.path == "/images/create":
+            attempts.append(request)
+            event = (
+                {"error": "unexpected EOF"}
+                if len(attempts) < 3
+                else {"status": "Status: Downloaded newer image for test"}
+            )
+            return httpx.Response(200, content=json.dumps(event) + "\n")
+        return httpx.Response(500, json={"message": "registry unavailable"})
+
+    client, _ = pull_client(handle)
+    progress = []
+    client.pull("luochend/tg-signpulse:0.9.4", on_progress=progress.append)
+    assert len(attempts) == 3
+    assert [e["message"] for e in progress if "message" in e] == [
+        "下载连接中断，正在重试（2/3）",
+        "下载连接中断，正在重试（3/3）",
+    ]
+
+
+@pytest.mark.parametrize("failure", ["transport", "http", "stream"])
+def test_pull_has_bounded_transient_retries(pull_client, failure):
+    import httpx
+
+    attempts = []
+
+    def handle(request):
+        if request.url.path == "/images/create":
+            attempts.append(request)
+            if failure == "transport":
+                raise httpx.ReadError("connection reset", request=request)
+            if failure == "http":
+                return httpx.Response(500, json={"message": "unexpected EOF"})
+            return httpx.Response(200, content='{"error":"unexpected EOF"}\n')
+        return httpx.Response(404, json={"message": "not found"})
+
+    client, calls = pull_client(handle)
+    with pytest.raises((DockerError, httpx.ReadError)):
+        client.pull("luochend/tg-signpulse:0.9.4")
+    assert len(attempts) == 3
+    assert not any(r.url.path.endswith("/tag") for r in calls)
+
+
+@pytest.mark.parametrize(
+    "status,message",
+    [(401, "denied"), (404, "manifest unknown"), (500, "manifest unknown")],
+)
+def test_pull_does_not_retry_permanent_failure(pull_client, status, message):
+    import httpx
+
+    client, calls = pull_client(
+        lambda request: httpx.Response(status, json={"message": message})
+    )
+    with pytest.raises(DockerError):
+        client.pull("luochend/tg-signpulse:0.9.4")
+    assert len(calls) == 1
+
+
+def test_pull_uses_configured_mirror_with_pinned_digest(pull_client):
+    import httpx
+
+    digest = "sha256:" + "a" * 64
+    attempted = []
+
+    def handle(request):
+        path = request.url.path
+        if path == "/images/create":
+            attempted.append(request.url.params)
+            if len(attempted) == 1:
+                return httpx.Response(200, content='{"error":"unexpected EOF"}\n')
+            return httpx.Response(
+                200, content='{"status":"Status: Image is up to date for test"}\n'
+            )
+        if path.startswith("/distribution/"):
+            return httpx.Response(200, json={"Descriptor": {"digest": digest}})
+        if path == "/info":
+            return httpx.Response(
+                200, json={"RegistryConfig": {"Mirrors": ["https://mirror.example/"]}}
+            )
+        if path.endswith("/json"):
+            return httpx.Response(200, json={"Id": NEW_IMAGE_ID})
+        if path.endswith("/tag"):
+            return httpx.Response(201)
+        raise AssertionError(path)
+
+    client, calls = pull_client(handle)
+    client.pull("luochend/tg-signpulse:0.9.4")
+    assert len(attempted) == 2
+    assert attempted[1]["fromImage"] == "mirror.example/luochend/tg-signpulse"
+    assert attempted[1]["tag"] == digest
+    tag = calls[-1]
+    assert tag.url.path == f"/images/{NEW_IMAGE_ID}/tag"
+    assert tag.url.params["repo"] == "luochend/tg-signpulse"
+    assert tag.url.params["tag"] == "0.9.4"
+
+
+@pytest.mark.parametrize(
+    "ref,expected",
+    [
+        ("luochend/tg-signpulse:0.9.4", "luochend/tg-signpulse"),
+        ("docker.io/luochend/tg-signpulse:0.9.4", "luochend/tg-signpulse"),
+        ("alpine:latest", "library/alpine"),
+        ("ghcr.io/loochenx/tg-signpulse:0.9.4", None),
+        ("localhost:5000/app:latest", None),
+    ],
+)
+def test_mirror_only_applies_to_docker_hub(ref, expected):
+    from backend.utils.docker_api import registry_mirror_refs
+
+    digest = "sha256:" + "a" * 64
+    mirrors = [
+        "https://mirror.example/",
+        "https://user:password@invalid.example/",
+        "https://invalid.example/path",
+    ]
+    assert registry_mirror_refs(ref, mirrors, digest) == (
+        [f"mirror.example/{expected}@{digest}"] if expected else []
+    )
+    assert registry_mirror_refs(ref, mirrors, "sha256:invalid") == []
+
+
+def test_failed_download_does_not_restart_or_retag(service, monkeypatch):
+    docker = FakeDocker()
+
+    def fail(ref, on_progress=None):
+        if on_progress:
+            on_progress({"message": "下载连接中断，正在重试（2/3）"})
+        assert service._job["state"] == "pulling"
+        assert service._job["message"].endswith("（2/3）")
+        raise DockerError(500, "unexpected EOF")
+
+    docker.pull = fail
+    monkeypatch.setattr(
+        service, "_docker", lambda: (docker, docker.containers[OLD_ID], None)
+    )
+    service.apply()
+    job = _wait_job(service)
+    assert job["state"] == "failed"
+    assert job["code"] == "download_interrupted"
+    assert "自动重试" in job["message"]
+    assert docker.created == []
+    assert not any(c[0] in ("tag", "stop") for c in docker.calls)
+
+
+@pytest.mark.parametrize("body", ["", '{"status":"Downloading"}\n', '{"status":'])
+def test_incomplete_download_stream_is_not_success(pull_client, body):
+    import httpx
+
+    def handle(request):
+        if request.url.path == "/images/create":
+            return httpx.Response(200, content=body)
+        return httpx.Response(404, json={"message": "not found"})
+
+    client, calls = pull_client(handle)
+    with pytest.raises(DockerError, match="did not finish"):
+        client.pull("luochend/tg-signpulse:0.9.4")
+    assert len([r for r in calls if r.url.path == "/images/create"]) == 3
+    assert not any(r.url.path.endswith("/tag") for r in calls)
+
+
+def test_refused_mirror_does_not_mark_original_as_refused(pull_client):
+    import httpx
+
+    digest = "sha256:" + "a" * 64
+    attempts = []
+
+    def handle(request):
+        if request.url.path == "/images/create":
+            attempts.append(request.url.params)
+            if len(attempts) == 1:
+                return httpx.Response(200, content='{"error":"unexpected EOF"}\n')
+            return httpx.Response(
+                404, json={"message": "mirror does not have this image"}
+            )
+        if request.url.path.startswith("/distribution/"):
+            return httpx.Response(200, json={"Descriptor": {"digest": digest}})
+        return httpx.Response(
+            200, json={"RegistryConfig": {"Mirrors": ["https://mirror.example/"]}}
+        )
+
+    client, _ = pull_client(handle)
+    with pytest.raises(DockerError) as exc:
+        client.pull("luochend/tg-signpulse:0.9.4")
+    # 第二次失败来自加速源，第三次回到原仓库，原仓库的实际拒绝应如实报告。
+    assert len(attempts) == 3
+    assert attempts[2]["fromImage"] == "luochend/tg-signpulse"
+    assert exc.value.status == 404

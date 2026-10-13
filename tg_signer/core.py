@@ -8,7 +8,8 @@ import re
 import sqlite3
 import time
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
 from typing import (
@@ -76,9 +77,139 @@ def _patched_sqlite3_connect(*args, **kwargs):
 
 sqlite3.connect = _patched_sqlite3_connect
 
-# Monkeypatch pyrogram.Client.invoke to add backpressure and retry logic for updates
+# Monkeypatch pyrogram.Client.invoke to bound channel difference synchronization.
 _original_invoke = BaseClient.invoke
-_get_channel_diff_semaphore = asyncio.Semaphore(50)
+
+_CHANNEL_DIFF_CONCURRENCY = 4
+_CHANNEL_DIFF_BASE_COOLDOWN = 2.0
+_CHANNEL_DIFF_MAX_COOLDOWN = 60.0
+_CHANNEL_DIFF_LOG_INTERVAL = 60.0
+_CHANNEL_DIFF_STATE_TTL = 60 * 60.0
+_CHANNEL_DIFF_MAX_STATES = 512
+_CHANNEL_DIFF_CLEANUP_INTERVAL = 60.0
+
+
+@dataclass
+class _ChannelDifferenceState:
+    in_flight: bool = False
+    failures: int = 0
+    retry_after: float = 0.0
+    log_after: float = 0.0
+    last_seen: float = 0.0
+
+
+_channel_diff_states: OrderedDict[tuple[int, int], _ChannelDifferenceState] = (
+    OrderedDict()
+)
+_channel_diff_active = 0
+_channel_diff_next_cleanup = 0.0
+
+
+def _channel_difference_key(self, query) -> tuple[int, int]:
+    session = getattr(self, "session", None)
+    channel = getattr(query, "channel", None)
+    channel_id = getattr(channel, "channel_id", 0)
+    return id(session if session is not None else self), int(channel_id or 0)
+
+
+def _prune_channel_difference_states(now: float) -> None:
+    global _channel_diff_next_cleanup
+
+    if (
+        now < _channel_diff_next_cleanup
+        and len(_channel_diff_states) < _CHANNEL_DIFF_MAX_STATES
+    ):
+        return
+
+    for key, state in list(_channel_diff_states.items()):
+        if (
+            not state.in_flight
+            and now >= state.retry_after
+            and now - state.last_seen >= _CHANNEL_DIFF_STATE_TTL
+        ):
+            _channel_diff_states.pop(key, None)
+
+    _channel_diff_next_cleanup = now + _CHANNEL_DIFF_CLEANUP_INTERVAL
+
+
+def _get_channel_difference_state(
+    key: tuple[int, int], now: float
+) -> _ChannelDifferenceState | None:
+    _prune_channel_difference_states(now)
+    state = _channel_diff_states.get(key)
+    if state is not None:
+        state.last_seen = now
+        _channel_diff_states.move_to_end(key)
+        return state
+
+    while len(_channel_diff_states) >= _CHANNEL_DIFF_MAX_STATES:
+        removable_key = next(
+            (
+                existing_key
+                for existing_key, existing_state in _channel_diff_states.items()
+                if not existing_state.in_flight
+                and now >= existing_state.retry_after
+            ),
+            None,
+        )
+        if removable_key is None:
+            return None
+        _channel_diff_states.pop(removable_key, None)
+
+    state = _ChannelDifferenceState(last_seen=now)
+    _channel_diff_states[key] = state
+    return state
+
+
+def _empty_channel_difference(query, retry_after: float, now: float):
+    # Keep the caller's pts unchanged. Kurigram will still enqueue the original
+    # UpdateNewChannelMessage after this enrichment request returns.
+    retry_in = max(0, int(retry_after - now + 0.999))
+    return raw.types.updates.ChannelDifferenceEmpty(
+        pts=query.pts,
+        timeout=retry_in,
+        final=None,
+    )
+
+
+def _is_transient_channel_difference_error(exc: Exception) -> bool:
+    return isinstance(
+        exc,
+        (
+            TimeoutError,
+            OSError,
+            ConnectionError,
+            errors.InternalServerError,
+            errors.ServiceUnavailable,
+        ),
+    )
+
+
+def _record_channel_difference_failure(
+    state: _ChannelDifferenceState,
+    now: float,
+    exc: Exception,
+) -> float:
+    state.failures = min(state.failures + 1, 8)
+    delay = min(
+        _CHANNEL_DIFF_MAX_COOLDOWN,
+        _CHANNEL_DIFF_BASE_COOLDOWN * (2 ** (state.failures - 1)),
+    )
+    if isinstance(exc, (errors.FloodWait, errors.FloodPremiumWait)):
+        # Do not hold a scarce synchronization slot while Telegram asks us to
+        # wait. The cooldown enforces the complete server-provided interval.
+        delay = max(delay, float(exc.value or 0))
+    delay += random.uniform(0.0, 1.0)
+    state.retry_after = max(state.retry_after, now + delay)
+
+    if now >= state.log_after:
+        logger.warning(
+            "Temporarily suppress GetChannelDifference for %.1fs after %s",
+            delay,
+            type(exc).__name__,
+        )
+        state.log_after = now + _CHANNEL_DIFF_LOG_INTERVAL
+    return state.retry_after
 
 
 def _read_positive_float_env(name: str, default: float, minimum: float = 1.0) -> float:
@@ -102,62 +233,62 @@ def _read_positive_int_env(name: str, default: int, minimum: int = 1) -> int:
 
 
 async def _patched_invoke(self, query, *args, **kwargs):
-    if isinstance(
-        query,
-        (
-            raw.functions.updates.GetChannelDifference,
-            raw.functions.updates.GetDifference,
-        ),
-    ):
-        # Disable Pyrogram's internal sleep and retry mechanisms to prevent blocking the semaphore indefinitely
-        kwargs.setdefault("sleep_threshold", 0)
+    if not isinstance(query, raw.functions.updates.GetChannelDifference):
+        return await _original_invoke(self, query, *args, **kwargs)
+
+    global _channel_diff_active
+
+    now = time.monotonic()
+    key = _channel_difference_key(self, query)
+    state = _get_channel_difference_state(key, now)
+    if state is None:
+        return _empty_channel_difference(query, now + 1.0, now)
+    if state.in_flight or now < state.retry_after:
+        return _empty_channel_difference(query, state.retry_after, now)
+
+    # This gate is intentionally non-blocking. Waiting on a semaphore would
+    # allow an unbounded number of SDK-created update tasks to accumulate.
+    if _channel_diff_active >= _CHANNEL_DIFF_CONCURRENCY:
+        return _empty_channel_difference(query, now + 1.0, now)
+
+    state.in_flight = True
+    _channel_diff_active += 1
+    try:
+        try:
+            requested_timeout = float(kwargs.get("timeout") or 0)
+        except (TypeError, ValueError):
+            requested_timeout = 0.0
+        kwargs["timeout"] = max(float(Session.WAIT_TIMEOUT), requested_timeout)
+        # Surface FloodWait immediately so its full duration can be recorded as
+        # cooldown without occupying one of the four network slots.
+        kwargs["sleep_threshold"] = 0
         kwargs["retries"] = 0
-        kwargs.setdefault("timeout", 5.0)
 
-        async with _get_channel_diff_semaphore:
-            max_retries = 2
-            base_delay = 1.0
-            for attempt in range(max_retries + 1):
-                try:
-                    return await _original_invoke(self, query, *args, **kwargs)
-                except Exception as e:
-                    err_str = str(e).lower()
-                    if (
-                        isinstance(e, asyncio.TimeoutError)
-                        or "timeout" in err_str
-                        or "connection" in err_str
-                        or "flood" in err_str
-                        or "network" in err_str
-                    ):
-                        if attempt < max_retries:
-                            delay = base_delay * (2**attempt) + random.uniform(0, 1)
-                            if "flood" in err_str and hasattr(e, "value"):
-                                delay = min(
-                                    e.value, 3.0
-                                )  # Wait for a shorter time, max 3 seconds
-                            await asyncio.sleep(delay)
-                            continue
-
-                        logger.warning(
-                            f"Drop updates for {type(query).__name__} due to error: {e}"
-                        )
-
-                        if isinstance(
-                            query, raw.functions.updates.GetChannelDifference
-                        ):
-                            from pyrogram.raw.types.updates import (
-                                ChannelDifferenceEmpty,
-                            )
-
-                            return ChannelDifferenceEmpty(
-                                pts=query.pts, timeout=0, final=True
-                            )
-                        elif isinstance(query, raw.functions.updates.GetDifference):
-                            from pyrogram.raw.types.updates import DifferenceEmpty
-
-                            return DifferenceEmpty(date=query.date, seq=query.pts)
-                    raise
-    return await _original_invoke(self, query, *args, **kwargs)
+        try:
+            result = await _original_invoke(self, query, *args, **kwargs)
+        except (errors.FloodWait, errors.FloodPremiumWait) as exc:
+            failure_time = time.monotonic()
+            retry_after = _record_channel_difference_failure(
+                state, failure_time, exc
+            )
+            return _empty_channel_difference(query, retry_after, failure_time)
+        except Exception as exc:
+            if not _is_transient_channel_difference_error(exc):
+                raise
+            failure_time = time.monotonic()
+            retry_after = _record_channel_difference_failure(
+                state, failure_time, exc
+            )
+            return _empty_channel_difference(query, retry_after, failure_time)
+        else:
+            state.failures = 0
+            state.retry_after = 0.0
+            state.log_after = 0.0
+            return result
+    finally:
+        state.in_flight = False
+        state.last_seen = time.monotonic()
+        _channel_diff_active -= 1
 
 
 BaseClient.invoke = _patched_invoke

@@ -30,6 +30,7 @@ settings = get_settings()
 
 DEFAULT_CONTINUE_TIMEOUT = 25
 DEFAULT_HISTORY_LIMIT = 10
+MONITOR_HEALTH_TIMEOUT = 8.0
 
 
 def _is_callback_data_invalid(exc: BaseException) -> bool:
@@ -335,6 +336,8 @@ class KeywordMonitorService:
         self._task_log_totals: dict[tuple[str, str], int] = {}
         self._task_status: dict[tuple[str, str], dict[str, Any]] = {}
         self._watchdog_task: asyncio.Task | None = None
+        self._health_failures: dict[str, int] = {}
+        self._health_retry_at: dict[str, float] = {}
 
     def _task_key(self, account_name: str, task_name: str) -> tuple[str, str]:
         return account_name, task_name
@@ -482,13 +485,15 @@ class KeywordMonitorService:
         if not expected_accounts:
             return not self._handler_refs
 
-        active_accounts = {
+        return expected_accounts.issubset(self._active_handler_accounts())
+
+    def _active_handler_accounts(self) -> set[str]:
+        return {
             account_name
             for account_name, client, _handler_ref in self._handler_refs
             if getattr(client, "is_connected", False)
             and getattr(client, "_tg_signpulse_no_updates", None) is False
         }
-        return expected_accounts.issubset(active_accounts)
 
     def _load_rules(self) -> list[KeywordMonitorRule]:
         from backend.services.sign_tasks import get_sign_task_service
@@ -1402,7 +1407,33 @@ class KeywordMonitorService:
         except Exception as exc:
             logger.warning("Keyword monitor handling failed: %s", exc, exc_info=True)
 
-    async def restart_from_tasks(self) -> None:
+    async def _stop_accounts(self, account_names: set[str]) -> None:
+        if not account_names:
+            return
+
+        stopped_refs = [
+            ref for ref in self._handler_refs if ref[0] in account_names
+        ]
+        for ref in stopped_refs:
+            account_name, client, handler_ref = ref
+            lock = get_account_lock(account_name)
+            async with lock:
+                try:
+                    client.remove_handler(*handler_ref)
+                except Exception:
+                    pass
+                try:
+                    await client.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            if ref in self._handler_refs:
+                self._handler_refs.remove(ref)
+            self._health_failures.pop(account_name, None)
+            self._health_retry_at.pop(account_name, None)
+
+    async def restart_from_tasks(
+        self, *, restart_accounts: set[str] | None = None
+    ) -> None:
         async with self._lock:
             from backend.services.config import get_config_service
             from tg_signer.core import (
@@ -1413,7 +1444,12 @@ class KeywordMonitorService:
 
             rules = self._load_rules()
             key = self._rules_key(rules)
-            if key == self._active_key and self._handlers_are_active_for(rules):
+            requested_accounts = set(restart_accounts or ())
+            if (
+                not requested_accounts
+                and key == self._active_key
+                and self._handlers_are_active_for(rules)
+            ):
                 for rule in rules:
                     if not self._task_logs.get(
                         self._task_key(rule.account_name, rule.task_name)
@@ -1425,11 +1461,29 @@ class KeywordMonitorService:
                         )
                 return
 
-            await self.stop()
-            self._rules = rules
             if not rules:
+                await self.stop()
+                self._rules = rules
                 self._active_key = key
                 return
+
+            accounts = sorted({rule.account_name for rule in rules})
+            force_recreate_accounts = requested_accounts & set(accounts)
+            rules_unchanged = self._rules_key(self._rules) == key
+            if rules_unchanged:
+                missing_accounts = set(accounts) - self._active_handler_accounts()
+                target_accounts = (requested_accounts | missing_accounts) & set(
+                    accounts
+                )
+                if not target_accounts:
+                    self._active_key = key
+                    return
+                await self._stop_accounts(target_accounts)
+                self._rules = rules
+            else:
+                await self.stop()
+                self._rules = rules
+                target_accounts = set(accounts)
 
             session_dir = settings.resolve_session_dir()
             global_settings = get_config_service().get_global_settings()
@@ -1441,9 +1495,7 @@ class KeywordMonitorService:
             except (TypeError, ValueError):
                 api_id = None
 
-            accounts = sorted({rule.account_name for rule in rules})
-            started_accounts: set[str] = set()
-            for account_name in accounts:
+            for account_name in sorted(target_accounts):
                 account_rules = [
                     rule for rule in rules if rule.account_name == account_name
                 ]
@@ -1480,7 +1532,15 @@ class KeywordMonitorService:
                 async with lock:
                     client_key = str(session_dir.joinpath(account_name).resolve())
                     existing = _CLIENT_INSTANCES.get(client_key)
-                    if (
+                    if account_name in force_recreate_accounts:
+                        logger.info(
+                            "Recreating unhealthy keyword monitor client for %s",
+                            account_name,
+                        )
+                        await close_client_by_name(
+                            account_name, workdir=session_dir
+                        )
+                    elif (
                         existing is not None
                         and getattr(existing, "_tg_signpulse_no_updates", None) is True
                     ):
@@ -1533,7 +1593,6 @@ class KeywordMonitorService:
                         continue
 
                     self._handler_refs.append((account_name, client, handler_ref))
-                    started_accounts.add(account_name)
                     logger.info(
                         "Keyword monitor started for %s in %s", account_name, chat_ids
                     )
@@ -1544,30 +1603,77 @@ class KeywordMonitorService:
                             active=True,
                         )
 
-            self._active_key = key if started_accounts == set(accounts) else ""
-            if started_accounts:
+            self._active_key = (
+                key
+                if set(accounts).issubset(self._active_handler_accounts())
+                else ""
+            )
+            if accounts:
                 self._start_watchdog()
 
     def _start_watchdog(self) -> None:
         if self._watchdog_task is None or self._watchdog_task.done():
             self._watchdog_task = asyncio.create_task(self._watchdog())
 
+    async def _watchdog_tick(self) -> None:
+        """闲时探测真实 RPC；连接标志为真也可能已经无法响应。"""
+        if not self._handler_refs and not self._rules:
+            return
+        expected_accounts = {rule.account_name for rule in self._rules}
+        restart_accounts = expected_accounts - self._active_handler_accounts()
+        for account_name, client, _ in list(self._handler_refs):
+            lock = get_account_lock(account_name)
+            if lock.locked():
+                continue
+            async with lock:
+                if not getattr(client, "is_connected", False):
+                    restart_accounts.add(account_name)
+                    continue
+                if time.monotonic() < self._health_retry_at.get(account_name, 0):
+                    continue
+                failed = False
+                flood_wait = None
+                try:
+                    await asyncio.wait_for(
+                        client.get_me(), timeout=MONITOR_HEALTH_TIMEOUT
+                    )
+                except (errors.FloodWait, errors.FloodPremiumWait) as exc:
+                    flood_wait = max(0, exc.value)
+                except Exception:
+                    failed = True
+                # 配置刷新可能在探测期间换掉了客户端；不把旧连接结果用于新连接。
+                if not any(
+                    name == account_name and active is client
+                    for name, active, _ in self._handler_refs
+                ):
+                    continue
+                if flood_wait is not None:
+                    # 限流响应说明服务可达；不把它算作连续连接失败。
+                    self._health_failures.pop(account_name, None)
+                    self._health_retry_at[account_name] = time.monotonic() + flood_wait
+                    continue
+                if failed:
+                    count = self._health_failures.get(account_name, 0) + 1
+                    self._health_failures[account_name] = count
+                    if count >= 2:
+                        restart_accounts.add(account_name)
+                else:
+                    self._health_failures.pop(account_name, None)
+                    self._health_retry_at.pop(account_name, None)
+        if restart_accounts:
+            logger.warning("关键词监控连接不可用，正在自动重建连接...")
+            # 失去 RPC 响应但 is_connected 仍为真时，不能命中原配置的复用路径。
+            self._active_key = ""
+            try:
+                await self.restart_from_tasks(restart_accounts=restart_accounts)
+            except Exception as exc:
+                logger.error("关键词监控 watchdog 重启失败: %s", exc)
+
     async def _watchdog(self) -> None:
-        """每 30s 检查一次 Pyrogram 客户端连接状态，断线则自动重启。"""
+        """每 30 秒探测连接，并重试暂时未能启动的监听。"""
         while True:
             await asyncio.sleep(30)
-            if not self._handler_refs:
-                continue
-            dead = any(
-                not getattr(client, "is_connected", True)
-                for _, client, _ in self._handler_refs
-            )
-            if dead:
-                logger.warning("关键词监控检测到 Telegram 连接断开，正在自动重启...")
-                try:
-                    await self.restart_from_tasks()
-                except Exception as exc:
-                    logger.error("关键词监控 watchdog 重启失败: %s", exc)
+            await self._watchdog_tick()
 
     async def stop(self) -> None:
         watchdog = self._watchdog_task
@@ -1595,6 +1701,8 @@ class KeywordMonitorService:
                 except Exception:
                     pass
         self._handler_refs = []
+        self._health_failures.clear()
+        self._health_retry_at.clear()
         self._rules = []
         self._active_key = ""
 

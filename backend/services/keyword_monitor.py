@@ -31,6 +31,9 @@ settings = get_settings()
 DEFAULT_CONTINUE_TIMEOUT = 25
 DEFAULT_HISTORY_LIMIT = 10
 MONITOR_HEALTH_TIMEOUT = 8.0
+MONITOR_START_TIMEOUT = 30.0
+MONITOR_RESTART_BASE_DELAY = 30.0
+MONITOR_RESTART_MAX_DELAY = 300.0
 
 
 def _is_callback_data_invalid(exc: BaseException) -> bool:
@@ -338,6 +341,8 @@ class KeywordMonitorService:
         self._watchdog_task: asyncio.Task | None = None
         self._health_failures: dict[str, int] = {}
         self._health_retry_at: dict[str, float] = {}
+        self._restart_failures: dict[str, int] = {}
+        self._restart_retry_at: dict[str, float] = {}
 
     def _task_key(self, account_name: str, task_name: str) -> tuple[str, str]:
         return account_name, task_name
@@ -492,6 +497,7 @@ class KeywordMonitorService:
             account_name
             for account_name, client, _handler_ref in self._handler_refs
             if getattr(client, "is_connected", False)
+            and getattr(client, "is_initialized", False)
             and getattr(client, "_tg_signpulse_no_updates", None) is False
         }
 
@@ -1573,8 +1579,19 @@ class KeywordMonitorService:
                         )
                     )
                     try:
-                        await client.__aenter__()
-                    except Exception:
+                        await asyncio.wait_for(
+                            client.__aenter__(), timeout=MONITOR_START_TIMEOUT
+                        )
+                    except Exception as exc:
+                        failures = min(self._restart_failures.get(account_name, 0) + 1, 6)
+                        self._restart_failures[account_name] = failures
+                        retry_delay = min(
+                            MONITOR_RESTART_MAX_DELAY,
+                            MONITOR_RESTART_BASE_DELAY * (2 ** (failures - 1)),
+                        )
+                        if isinstance(exc, (errors.FloodWait, errors.FloodPremiumWait)):
+                            retry_delay = max(retry_delay, float(exc.value or 0))
+                        self._restart_retry_at[account_name] = time.monotonic() + retry_delay
                         try:
                             client.remove_handler(*handler_ref)
                         except Exception:
@@ -1587,11 +1604,13 @@ class KeywordMonitorService:
                         for rule in account_rules:
                             self._append_rule_log(
                                 rule,
-                                "关键词后台监听启动失败：Telegram client 启动失败，请检查账号登录状态、代理或 API 配置",
+                                f"关键词后台监听暂时无法启动，{int(retry_delay)} 秒后自动重试",
                                 active=False,
                             )
                         continue
 
+                    self._restart_failures.pop(account_name, None)
+                    self._restart_retry_at.pop(account_name, None)
                     self._handler_refs.append((account_name, client, handler_ref))
                     logger.info(
                         "Keyword monitor started for %s in %s", account_name, chat_ids
@@ -1626,7 +1645,10 @@ class KeywordMonitorService:
             if lock.locked():
                 continue
             async with lock:
-                if not getattr(client, "is_connected", False):
+                if (
+                    not getattr(client, "is_connected", False)
+                    or not getattr(client, "is_initialized", False)
+                ):
                     restart_accounts.add(account_name)
                     continue
                 if time.monotonic() < self._health_retry_at.get(account_name, 0):
@@ -1660,6 +1682,12 @@ class KeywordMonitorService:
                 else:
                     self._health_failures.pop(account_name, None)
                     self._health_retry_at.pop(account_name, None)
+        now = time.monotonic()
+        restart_accounts = {
+            name for name in restart_accounts
+            if now >= self._restart_retry_at.get(name, 0)
+            and not get_account_lock(name).locked()
+        }
         if restart_accounts:
             logger.warning("关键词监控连接不可用，正在自动重建连接...")
             # 失去 RPC 响应但 is_connected 仍为真时，不能命中原配置的复用路径。
@@ -1703,6 +1731,8 @@ class KeywordMonitorService:
         self._handler_refs = []
         self._health_failures.clear()
         self._health_retry_at.clear()
+        self._restart_failures.clear()
+        self._restart_retry_at.clear()
         self._rules = []
         self._active_key = ""
 

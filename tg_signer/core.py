@@ -8,8 +8,7 @@ import re
 import sqlite3
 import time
 import unicodedata
-from collections import Counter, OrderedDict, defaultdict
-from dataclasses import dataclass
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
 from typing import (
@@ -23,7 +22,7 @@ import httpx
 from croniter import CroniterBadCronError, croniter
 from pydantic import BaseModel, ValidationError
 from pyrogram import Client as BaseClient
-from pyrogram import errors, filters, raw
+from pyrogram import errors, filters
 from pyrogram.enums import ChatMembersFilter, ChatType
 from pyrogram.handlers import EditedMessageHandler, MessageHandler
 from pyrogram.methods.utilities.idle import idle
@@ -60,6 +59,7 @@ from tg_signer.config import (
 
 from .ai_tools import AITools, OpenAIConfigManager
 from .notification.server_chan import sc_send
+from .update_guard import install_update_guard
 from .utils import UserInput, print_to_user
 
 # Monkeypatch sqlite3.connect to increase default timeout
@@ -76,141 +76,6 @@ def _patched_sqlite3_connect(*args, **kwargs):
 
 
 sqlite3.connect = _patched_sqlite3_connect
-
-# Monkeypatch pyrogram.Client.invoke to bound channel difference synchronization.
-_original_invoke = BaseClient.invoke
-
-_CHANNEL_DIFF_CONCURRENCY = 4
-_CHANNEL_DIFF_BASE_COOLDOWN = 2.0
-_CHANNEL_DIFF_MAX_COOLDOWN = 60.0
-_CHANNEL_DIFF_LOG_INTERVAL = 60.0
-_CHANNEL_DIFF_STATE_TTL = 60 * 60.0
-_CHANNEL_DIFF_MAX_STATES = 512
-_CHANNEL_DIFF_CLEANUP_INTERVAL = 60.0
-
-
-@dataclass
-class _ChannelDifferenceState:
-    in_flight: bool = False
-    failures: int = 0
-    retry_after: float = 0.0
-    log_after: float = 0.0
-    last_seen: float = 0.0
-
-
-_channel_diff_states: OrderedDict[tuple[int, int], _ChannelDifferenceState] = (
-    OrderedDict()
-)
-_channel_diff_active = 0
-_channel_diff_next_cleanup = 0.0
-
-
-def _channel_difference_key(self, query) -> tuple[int, int]:
-    session = getattr(self, "session", None)
-    channel = getattr(query, "channel", None)
-    channel_id = getattr(channel, "channel_id", 0)
-    return id(session if session is not None else self), int(channel_id or 0)
-
-
-def _prune_channel_difference_states(now: float) -> None:
-    global _channel_diff_next_cleanup
-
-    if (
-        now < _channel_diff_next_cleanup
-        and len(_channel_diff_states) < _CHANNEL_DIFF_MAX_STATES
-    ):
-        return
-
-    for key, state in list(_channel_diff_states.items()):
-        if (
-            not state.in_flight
-            and now >= state.retry_after
-            and now - state.last_seen >= _CHANNEL_DIFF_STATE_TTL
-        ):
-            _channel_diff_states.pop(key, None)
-
-    _channel_diff_next_cleanup = now + _CHANNEL_DIFF_CLEANUP_INTERVAL
-
-
-def _get_channel_difference_state(
-    key: tuple[int, int], now: float
-) -> _ChannelDifferenceState | None:
-    _prune_channel_difference_states(now)
-    state = _channel_diff_states.get(key)
-    if state is not None:
-        state.last_seen = now
-        _channel_diff_states.move_to_end(key)
-        return state
-
-    while len(_channel_diff_states) >= _CHANNEL_DIFF_MAX_STATES:
-        removable_key = next(
-            (
-                existing_key
-                for existing_key, existing_state in _channel_diff_states.items()
-                if not existing_state.in_flight
-                and now >= existing_state.retry_after
-            ),
-            None,
-        )
-        if removable_key is None:
-            return None
-        _channel_diff_states.pop(removable_key, None)
-
-    state = _ChannelDifferenceState(last_seen=now)
-    _channel_diff_states[key] = state
-    return state
-
-
-def _empty_channel_difference(query, retry_after: float, now: float):
-    # Keep the caller's pts unchanged. Kurigram will still enqueue the original
-    # UpdateNewChannelMessage after this enrichment request returns.
-    retry_in = max(0, int(retry_after - now + 0.999))
-    return raw.types.updates.ChannelDifferenceEmpty(
-        pts=query.pts,
-        timeout=retry_in,
-        final=None,
-    )
-
-
-def _is_transient_channel_difference_error(exc: Exception) -> bool:
-    return isinstance(
-        exc,
-        (
-            TimeoutError,
-            OSError,
-            ConnectionError,
-            errors.InternalServerError,
-            errors.ServiceUnavailable,
-        ),
-    )
-
-
-def _record_channel_difference_failure(
-    state: _ChannelDifferenceState,
-    now: float,
-    exc: Exception,
-) -> float:
-    state.failures = min(state.failures + 1, 8)
-    delay = min(
-        _CHANNEL_DIFF_MAX_COOLDOWN,
-        _CHANNEL_DIFF_BASE_COOLDOWN * (2 ** (state.failures - 1)),
-    )
-    if isinstance(exc, (errors.FloodWait, errors.FloodPremiumWait)):
-        # Do not hold a scarce synchronization slot while Telegram asks us to
-        # wait. The cooldown enforces the complete server-provided interval.
-        delay = max(delay, float(exc.value or 0))
-    delay += random.uniform(0.0, 1.0)
-    state.retry_after = max(state.retry_after, now + delay)
-
-    if now >= state.log_after:
-        logger.warning(
-            "Temporarily suppress GetChannelDifference for %.1fs after %s",
-            delay,
-            type(exc).__name__,
-        )
-        state.log_after = now + _CHANNEL_DIFF_LOG_INTERVAL
-    return state.retry_after
-
 
 def _read_positive_float_env(name: str, default: float, minimum: float = 1.0) -> float:
     raw = os.getenv(name)
@@ -232,68 +97,10 @@ def _read_positive_int_env(name: str, default: int, minimum: int = 1) -> int:
         return default
 
 
-async def _patched_invoke(self, query, *args, **kwargs):
-    if not isinstance(query, raw.functions.updates.GetChannelDifference):
-        return await _original_invoke(self, query, *args, **kwargs)
-
-    global _channel_diff_active
-
-    now = time.monotonic()
-    key = _channel_difference_key(self, query)
-    state = _get_channel_difference_state(key, now)
-    if state is None:
-        return _empty_channel_difference(query, now + 1.0, now)
-    if state.in_flight or now < state.retry_after:
-        return _empty_channel_difference(query, state.retry_after, now)
-
-    # This gate is intentionally non-blocking. Waiting on a semaphore would
-    # allow an unbounded number of SDK-created update tasks to accumulate.
-    if _channel_diff_active >= _CHANNEL_DIFF_CONCURRENCY:
-        return _empty_channel_difference(query, now + 1.0, now)
-
-    state.in_flight = True
-    _channel_diff_active += 1
-    try:
-        try:
-            requested_timeout = float(kwargs.get("timeout") or 0)
-        except (TypeError, ValueError):
-            requested_timeout = 0.0
-        kwargs["timeout"] = max(float(Session.WAIT_TIMEOUT), requested_timeout)
-        # Surface FloodWait immediately so its full duration can be recorded as
-        # cooldown without occupying one of the four network slots.
-        kwargs["sleep_threshold"] = 0
-        kwargs["retries"] = 0
-
-        try:
-            result = await _original_invoke(self, query, *args, **kwargs)
-        except (errors.FloodWait, errors.FloodPremiumWait) as exc:
-            failure_time = time.monotonic()
-            retry_after = _record_channel_difference_failure(
-                state, failure_time, exc
-            )
-            return _empty_channel_difference(query, retry_after, failure_time)
-        except Exception as exc:
-            if not _is_transient_channel_difference_error(exc):
-                raise
-            failure_time = time.monotonic()
-            retry_after = _record_channel_difference_failure(
-                state, failure_time, exc
-            )
-            return _empty_channel_difference(query, retry_after, failure_time)
-        else:
-            state.failures = 0
-            state.retry_after = 0.0
-            state.log_after = 0.0
-            return result
-    finally:
-        state.in_flight = False
-        state.last_seen = time.monotonic()
-        _channel_diff_active -= 1
-
-
-BaseClient.invoke = _patched_invoke
-
 logger = logging.getLogger("tg-signer")
+
+# Guard live updates before peer resolution, leaving business and gap recovery RPCs intact.
+install_update_guard()
 
 DICE_EMOJIS = ("🎲", "🎯", "🏀", "⚽", "🎳", "🎰")
 
@@ -347,11 +154,157 @@ def readable_chat(chat: Chat):
 
 _CLIENT_INSTANCES: dict[str, "Client"] = {}
 
-# reference counts and async locks for shared client lifecycle management
-# Keyed by account name. Use asyncio locks to serialize start/stop operations
-# so multiple coroutines in the same process can safely share one Client.
+# These mappings remain available for callers that inspect the shared cache, but
+# lifecycle ownership belongs to the concrete Client instance.  An old reference
+# must never decrement the count or acquire the lock of a replacement instance.
 _CLIENT_REFS: defaultdict[str, int] = defaultdict(int)
 _CLIENT_ASYNC_LOCKS: dict[str, asyncio.Lock] = {}
+_CLIENT_CLOSING: set[str] = set()
+_CLIENT_STOP_TIMEOUT = 5.0
+
+
+def _sqlite_connection_is_open(storage) -> bool:
+    conn = getattr(storage, "conn", None)
+    if conn is None:
+        return False
+    try:
+        conn.execute("SELECT 1")
+    except sqlite3.ProgrammingError:
+        return False
+    except Exception:
+        # A busy/locked connection is still open and must be closed.
+        return True
+    return True
+
+
+async def _finalize_client_resources(client: "Client") -> None:
+    """Close a fully started or partially started Kurigram client.
+
+    Kurigram's stop() calls terminate() before disconnect().  When start() has
+    connected but initialize() did not finish, terminate() raises and the
+    storage connection would otherwise remain open.  Always fall back to the
+    lower-level worker/session/storage cleanup.
+    """
+
+    try:
+        from tg_signer.update_guard import close_update_guard
+    except ImportError:
+        close_update_guard = None
+    if close_update_guard is not None:
+        try:
+            await asyncio.wait_for(
+                close_update_guard(client), timeout=_CLIENT_STOP_TIMEOUT
+            )
+        except Exception as exc:
+            logger.warning(
+                "Update guard cleanup failed for client %s: %s",
+                client.name,
+                exc,
+            )
+
+    normal_stop_succeeded = False
+    if getattr(client, "is_initialized", False):
+        try:
+            await asyncio.wait_for(client.stop(), timeout=_CLIENT_STOP_TIMEOUT)
+            normal_stop_succeeded = True
+        except Exception as exc:
+            logger.warning(
+                "Normal stop failed for client %s, forcing cleanup: %s",
+                client.name,
+                exc,
+            )
+
+    if not normal_stop_succeeded:
+        # Partial initialize may already have created dispatcher/update tasks
+        # while is_initialized is still false.  Cancel them independently of
+        # is_connected and before closing Session/Storage.
+        tasks = []
+        watchdog = getattr(client, "updates_watchdog_task", None)
+        if watchdog is not None and not watchdog.done():
+            watchdog.cancel()
+            tasks.append(watchdog)
+        dispatcher = getattr(client, "dispatcher", None)
+        for task in list(getattr(dispatcher, "handler_worker_tasks", ())):
+            if not task.done():
+                task.cancel()
+                tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        disconnect_succeeded = False
+        if getattr(client, "is_connected", False):
+            try:
+                # disconnect() is the correct SDK path for the connected but
+                # not initialized state and closes Session and Storage.
+                await asyncio.wait_for(
+                    client.disconnect(), timeout=_CLIENT_STOP_TIMEOUT
+                )
+                disconnect_succeeded = True
+            except Exception as exc:
+                logger.warning(
+                    "Disconnect failed for client %s, forcing resource cleanup: %s",
+                    client.name,
+                    exc,
+                )
+
+        # connect() sets is_connected only after Session.start() completes.  A
+        # cancelled Session.start() can therefore leave recv/ping tasks behind
+        # while the flag is still false.
+        session = getattr(client, "session", None)
+        if session is not None and not disconnect_succeeded:
+            try:
+                await asyncio.wait_for(session.stop(), timeout=_CLIENT_STOP_TIMEOUT)
+            except Exception:
+                session_tasks = []
+                for attr in ("ping_task", "recv_task"):
+                    task = getattr(session, attr, None)
+                    if task is not None and not task.done():
+                        task.cancel()
+                        session_tasks.append(task)
+                if session_tasks:
+                    await asyncio.gather(*session_tasks, return_exceptions=True)
+                connection = getattr(session, "connection", None)
+                if connection is not None:
+                    try:
+                        await asyncio.wait_for(
+                            connection.close(), timeout=_CLIENT_STOP_TIMEOUT
+                        )
+                    except Exception:
+                        pass
+
+
+    storage = getattr(client, "storage", None)
+    if storage is not None and _sqlite_connection_is_open(storage):
+        try:
+            await storage.close()
+        except Exception as exc:
+            conn = getattr(storage, "conn", None)
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                logger.warning(
+                    "Storage close failed for client %s: %s", client.name, exc
+                )
+
+    # The object is never reused while cleanup is in progress.  Normalize SDK
+    # state only after all close attempts have completed.
+    client.is_connected = False
+    client.is_initialized = False
+    client._tg_signpulse_clean = True
+
+
+async def _complete_client_cleanup(client: "Client") -> None:
+    """Finish cleanup even if the caller is cancelled midway."""
+
+    cleanup_task = asyncio.create_task(_finalize_client_resources(client))
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        # asyncio cancellation is delivered once.  Waiting here prevents a new
+        # client for the same SQLite file from being published too early.
+        await cleanup_task
+        raise
 
 
 class Client(BaseClient):
@@ -360,96 +313,111 @@ class Client(BaseClient):
         self._tg_signpulse_no_updates = kwargs.get("no_updates")
         super().__init__(name, *args, **kwargs)
         self.key = key or str(pathlib.Path(self.workdir).joinpath(self.name).resolve())
+        self._tg_signpulse_lifecycle_lock = asyncio.Lock()
+        self._tg_signpulse_refs = 0
+        self._tg_signpulse_retired = False
+        self._tg_signpulse_clean = True
         if self.in_memory and not self.session_string:
             self.load_session_string()
             self.storage = MemoryStorage(self.name, self.session_string)
 
+    def _sync_shared_state(self) -> None:
+        if _CLIENT_INSTANCES.get(self.key) is self:
+            _CLIENT_REFS[self.key] = self._tg_signpulse_refs
+            _CLIENT_ASYNC_LOCKS[self.key] = self._tg_signpulse_lifecycle_lock
+
+    def _retire_failed_instance(self) -> None:
+        self._tg_signpulse_retired = True
+        if _CLIENT_INSTANCES.get(self.key) is self:
+            _CLIENT_INSTANCES.pop(self.key, None)
+            _CLIENT_REFS.pop(self.key, None)
+            if _CLIENT_ASYNC_LOCKS.get(self.key) is self._tg_signpulse_lifecycle_lock:
+                _CLIENT_ASYNC_LOCKS.pop(self.key, None)
+
+    async def authorize(self, *args, **kwargs):
+        # Shared/background clients may only open an existing authorized
+        # session.  Interactive phone/2FA login uses Pyrogram's BaseClient in
+        # backend.services.telegram and must never be reached from a scheduler.
+        raise ConnectionError("Session invalid: authorization required")
+
     async def __aenter__(self):
-        lock = _CLIENT_ASYNC_LOCKS.get(self.key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _CLIENT_ASYNC_LOCKS[self.key] = lock
-        async with lock:
-            _CLIENT_REFS[self.key] += 1
-            if _CLIENT_REFS[self.key] == 1:
-                # Retry loop for database locks
+        async with self._tg_signpulse_lifecycle_lock:
+            if self._tg_signpulse_retired:
+                raise RuntimeError(f"Client {self.name} has been closed")
+
+            self._tg_signpulse_refs += 1
+            self._sync_shared_state()
+            if self._tg_signpulse_refs > 1:
+                return self
+
+            self._tg_signpulse_clean = False
+            try:
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        if not self.is_connected:
-                            await self.connect()
-
-                        # start() 内部会完成 session 校验，直接捕获 auth 错误
-                        # 无需在 start() 前额外调 get_me()（避免双重 API 请求）
+                        # start() owns the entire Kurigram connect -> authorize
+                        # -> get_me -> initialize sequence.  Calling connect()
+                        # first leaves the client connected but uninitialized.
+                        self._tg_signpulse_clean = False
+                        await self.start()
                         try:
-                            await self.start()
-                        except (
-                            errors.Unauthorized,
-                            errors.AuthKeyUnregistered,
-                            errors.AuthKeyInvalid,
-                            errors.SessionRevoked,
-                            errors.SessionExpired,
-                        ) as e:
-                            raise ConnectionError(f"Session invalid: {e}")
-                        except ConnectionError as e:
-                            if "already connected" not in str(e).lower():
-                                raise
+                            from tg_signer.update_guard import activate_update_guard
+                        except ImportError:
+                            activate_update_guard = None
+                        if activate_update_guard is not None:
+                            activate_update_guard(self)
 
-                        # Enable WAL mode after start
-                        if hasattr(self, "storage") and hasattr(self.storage, "conn"):
+                        conn = getattr(getattr(self, "storage", None), "conn", None)
+                        if conn is not None:
                             try:
-                                self.storage.conn.execute("PRAGMA journal_mode=WAL")
-                                self.storage.conn.execute("PRAGMA busy_timeout=30000")
-                            except Exception as e:
-                                logger.error(f"Failed to enable WAL mode: {e}")
-
-                        # Success! Break loop
-                        break
-
-                    except Exception as e:
-                        # If this is a database lock and we have retries left, wait and retry
-                        is_locked = "database is locked" in str(e)
+                                conn.execute("PRAGMA journal_mode=WAL")
+                                conn.execute("PRAGMA busy_timeout=30000")
+                            except Exception as exc:
+                                logger.error("Failed to enable WAL mode: %s", exc)
+                        return self
+                    except (
+                        errors.Unauthorized,
+                        errors.AuthKeyUnregistered,
+                        errors.AuthKeyInvalid,
+                        errors.SessionRevoked,
+                        errors.SessionExpired,
+                    ) as exc:
+                        raise ConnectionError(f"Session invalid: {exc}") from exc
+                    except Exception as exc:
+                        await _complete_client_cleanup(self)
+                        is_locked = "database is locked" in str(exc).lower()
                         if is_locked and attempt < max_retries - 1:
-                            # Cleanup before retry
-                            try:
-                                if self.is_connected:
-                                    await self.stop()
-                            except Exception:
-                                pass
-
                             wait_time = (attempt + 1) * 2
                             logger.warning(
-                                f"Database locked when starting client {self.name}, retrying in {wait_time}s... ({attempt + 1}/{max_retries})"
+                                "Database locked when starting client %s, "
+                                "retrying in %ss... (%s/%s)",
+                                self.name,
+                                wait_time,
+                                attempt + 1,
+                                max_retries,
                             )
                             await asyncio.sleep(wait_time)
                             continue
-
-                        # If execution reaches here, it's a fatal error or retries exhausted
-                        # Rollback the ref count
-                        _CLIENT_REFS[self.key] -= 1
-                        if _CLIENT_REFS[self.key] <= 0:
-                            _CLIENT_REFS.pop(self.key, None)
-                            _CLIENT_INSTANCES.pop(self.key, None)
-                            try:
-                                await self.stop()
-                            except Exception:
-                                pass
                         raise
-            return self
+            except BaseException:
+                # start() can be cancelled after storage.open() or connect().
+                # Always release those partial resources before retiring it.
+                try:
+                    await _complete_client_cleanup(self)
+                finally:
+                    self._tg_signpulse_refs = max(0, self._tg_signpulse_refs - 1)
+                    self._retire_failed_instance()
+                raise
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        lock = _CLIENT_ASYNC_LOCKS.get(self.key)
-        if lock is None:
-            return
-        async with lock:
-            _CLIENT_REFS[self.key] -= 1
-            if _CLIENT_REFS[self.key] == 0:
-                try:
-                    await self.stop()
-                except Exception:
-                    pass
-                # DO NOT POP FROM _CLIENT_INSTANCES HERE.
-                # Keep the client instance cached so future connections reuse the safe asyncio lock mechanisms.
+        async with self._tg_signpulse_lifecycle_lock:
+            if self._tg_signpulse_refs <= 0:
+                return
+            self._tg_signpulse_refs -= 1
+            self._sync_shared_state()
+            if self._tg_signpulse_refs == 0:
+                await _complete_client_cleanup(self)
+                self._sync_shared_state()
 
     @property
     def session_string_file(self):
@@ -525,21 +493,30 @@ def get_client(
         api_hash = api_hash or _api_hash
 
     key = str(pathlib.Path(workdir).joinpath(name).resolve())
-    if key in _CLIENT_INSTANCES:
-        existing = _CLIENT_INSTANCES[key]
+    if key in _CLIENT_CLOSING:
+        raise RuntimeError(f"Client {name} is being closed")
+
+    existing = _CLIENT_INSTANCES.get(key)
+    if existing is not None:
         requested_no_updates = kwargs.get("no_updates")
         existing_no_updates = getattr(existing, "_tg_signpulse_no_updates", None)
-        refs = _CLIENT_REFS.get(key, 0)
+        refs = existing._tg_signpulse_refs
         if (
             requested_no_updates is not None
             and existing_no_updates is not None
             and requested_no_updates != existing_no_updates
             and refs <= 0
             and not getattr(existing, "is_connected", False)
+            and existing._tg_signpulse_clean
         ):
+            existing._tg_signpulse_retired = True
             _CLIENT_INSTANCES.pop(key, None)
+            _CLIENT_REFS.pop(key, None)
+            if _CLIENT_ASYNC_LOCKS.get(key) is existing._tg_signpulse_lifecycle_lock:
+                _CLIENT_ASYNC_LOCKS.pop(key, None)
         else:
             return existing
+
     client = Client(
         name,
         api_id=api_id,
@@ -552,46 +529,38 @@ def get_client(
         **kwargs,
     )
     _CLIENT_INSTANCES[key] = client
+    _CLIENT_REFS[key] = 0
+    _CLIENT_ASYNC_LOCKS[key] = client._tg_signpulse_lifecycle_lock
     return client
 
 
 async def close_client_by_name(name: str, workdir: str | pathlib.Path = "."):
-    """
-    Forcefully close a client instance by its name and release resources.
-    """
+    """Close and retire the cached client before a replacement can be published."""
+
     key = str(pathlib.Path(workdir).joinpath(name).resolve())
+    _CLIENT_CLOSING.add(key)
+    try:
+        client = _CLIENT_INSTANCES.get(key)
+        if client is None:
+            _CLIENT_REFS.pop(key, None)
+            _CLIENT_ASYNC_LOCKS.pop(key, None)
+            return
 
-    # Check if we have a lock for this client
-    lock = _CLIENT_ASYNC_LOCKS.get(key)
-    client_to_stop = None
-    if lock:
-        try:
-            await asyncio.wait_for(lock.acquire(), timeout=5.0)
-            try:
-                _CLIENT_REFS[key] = 0
-                # 在锁内弹出实例，阻止其他协程复用此 client
-                client_to_stop = _CLIENT_INSTANCES.pop(key, None)
-            finally:
-                lock.release()
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"Timeout waiting for lock on client {name}, proceeding with forceful cleanup"
-            )
-            _CLIENT_REFS[key] = 0
-            client_to_stop = _CLIENT_INSTANCES.pop(key, None)
-    else:
-        client_to_stop = _CLIENT_INSTANCES.pop(key, None)
+        async with client._tg_signpulse_lifecycle_lock:
+            client._tg_signpulse_retired = True
+            client._tg_signpulse_refs = 0
+            client._sync_shared_state()
+            await _complete_client_cleanup(client)
 
-    if client_to_stop:
-        try:
-            if client_to_stop.is_connected:
-                await client_to_stop.stop()
-        except Exception as e:
-            logger.warning(f"Error stopping client {name}: {e}")
-
-    # Clean up locks
-    _CLIENT_ASYNC_LOCKS.pop(key, None)
-    _CLIENT_REFS.pop(key, None)
+            # Identity checks keep a late exit from an old object from deleting
+            # lifecycle state belonging to a replacement.
+            if _CLIENT_INSTANCES.get(key) is client:
+                _CLIENT_INSTANCES.pop(key, None)
+                _CLIENT_REFS.pop(key, None)
+            if _CLIENT_ASYNC_LOCKS.get(key) is client._tg_signpulse_lifecycle_lock:
+                _CLIENT_ASYNC_LOCKS.pop(key, None)
+    finally:
+        _CLIENT_CLOSING.discard(key)
 
 
 def get_now():
@@ -644,6 +613,7 @@ class BaseUserWorker(Generic[ConfigT]):
         }
         if no_updates is not None:
             client_kwargs["no_updates"] = no_updates
+        self._client_kwargs = dict(client_kwargs)
 
         self.app = get_client(
             account,
@@ -654,6 +624,16 @@ class BaseUserWorker(Generic[ConfigT]):
         self.user: User | None = None
         self._config = None
         self.context = self.ensure_ctx()
+
+    def _refresh_retired_client(self) -> None:
+        if not getattr(self.app, "_tg_signpulse_retired", False):
+            return
+        self.app = get_client(
+            self._account,
+            self._proxy,
+            **self._client_kwargs,
+        )
+        self.loop = self.app.loop
 
     def ensure_ctx(self):
         return {}
@@ -1386,6 +1366,7 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
     async def run(
         self, num_of_dialogs=20, only_once: bool = False, force_rerun: bool = False
     ):
+        self._refresh_retired_client()
         if self.app.in_memory or self.app.session_string:
             return await self.in_memory_run(
                 num_of_dialogs, only_once=only_once, force_rerun=force_rerun

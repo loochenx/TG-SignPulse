@@ -13,6 +13,7 @@ from tg_signer import core
 class _Client:
     def __init__(self, *, start_error=None, health_errors=None):
         self.is_connected = True
+        self.is_initialized = True
         self._tg_signpulse_no_updates = False
         self.start_error = start_error
         self.health_errors = list(health_errors or [])
@@ -190,3 +191,111 @@ async def test_health_failure_rebuilds_only_unresponsive_account(
         client for name, client, _ref in service._handler_refs if name == "broken"
     ) is replacement
     assert service._active_key == service._rules_key(rules)
+
+
+
+@pytest.mark.asyncio
+async def test_watchdog_backs_off_failed_start_without_disrupting_healthy_account(
+    monkeypatch, tmp_path
+):
+    now = [100.0]
+    monkeypatch.setattr(keyword_monitor.time, "monotonic", lambda: now[0])
+    rules = [_rule("healthy", 101), _rule("missing", 202)]
+    healthy = _Client()
+    service, requested, _close, _cache = _prepare_service(
+        monkeypatch, tmp_path, rules,
+        {"missing": [_Client(start_error=OSError("offline")),
+                     _Client(start_error=OSError("offline")), _Client()]},
+    )
+    service._handler_refs = [("healthy", healthy, (object(), 0))]
+    await service.restart_from_tasks()
+    assert service._restart_retry_at["missing"] == 130.0
+    await service._watchdog_tick()
+    assert requested == ["missing"]
+    now[0] = 130.0
+    await service._watchdog_tick()
+    assert requested == ["missing", "missing"]
+    assert service._restart_retry_at["missing"] == 190.0
+    now[0] = 160.0
+    await service._watchdog_tick()
+    assert requested == ["missing", "missing"]
+    now[0] = 190.0
+    await service._watchdog_tick()
+    assert requested == ["missing", "missing", "missing"]
+    assert not service._restart_retry_at
+    assert not service._restart_failures
+    assert healthy.remove_calls == healthy.exit_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_watchdog_start_backoff_respects_full_flood_wait(monkeypatch, tmp_path):
+    from pyrogram import errors
+
+    now = [100.0]
+    monkeypatch.setattr(keyword_monitor.time, "monotonic", lambda: now[0])
+    rules = [_rule("limited", 101)]
+    service, requested, _close, _cache = _prepare_service(
+        monkeypatch, tmp_path, rules,
+        {"limited": [_Client(start_error=errors.FloodWait(450)), _Client()]},
+    )
+    await service.restart_from_tasks()
+    assert service._restart_retry_at["limited"] == 550.0
+    now[0] = 400.0
+    await service._watchdog_tick()
+    assert requested == ["limited"]
+    now[0] = 550.0
+    await service._watchdog_tick()
+    assert requested == ["limited", "limited"]
+    assert not service._restart_retry_at
+
+
+@pytest.mark.asyncio
+async def test_connected_but_uninitialized_monitor_is_recreated(monkeypatch, tmp_path):
+    rules = [_rule("broken", 101)]
+    broken = _Client()
+    broken.is_initialized = False
+    broken.get_me = AsyncMock()
+    replacement = _Client()
+    service, requested, close, cache = _prepare_service(
+        monkeypatch, tmp_path, rules, {"broken": [replacement]},
+    )
+    service._handler_refs = [("broken", broken, (object(), 0))]
+    cache[str(tmp_path.joinpath("broken").resolve())] = broken
+    assert not service._handlers_are_active_for(rules)
+    await service._watchdog_tick()
+    assert requested == ["broken"]
+    close.assert_awaited_once_with("broken", workdir=tmp_path)
+    broken.get_me.assert_not_awaited()
+    assert service._handlers_are_active_for(rules)
+
+
+
+@pytest.mark.asyncio
+async def test_monitor_start_has_deadline_and_preserves_healthy_listener(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(keyword_monitor, "MONITOR_START_TIMEOUT", 0.01)
+    rules = [_rule("healthy", 101), _rule("stuck", 202)]
+    healthy = _Client()
+    stuck = _Client()
+    cancelled = asyncio.Event()
+
+    async def start_forever():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    stuck.__aenter__ = start_forever
+    service, requested, _close, _cache = _prepare_service(
+        monkeypatch, tmp_path, rules, {"stuck": [stuck]},
+    )
+    healthy_ref = ("healthy", healthy, (object(), 0))
+    service._handler_refs = [healthy_ref]
+    await asyncio.wait_for(service.restart_from_tasks(), timeout=0.2)
+    assert cancelled.is_set()
+    assert requested == ["stuck"]
+    assert service._handler_refs == [healthy_ref]
+    assert healthy.exit_calls == healthy.remove_calls == 0
+    assert stuck.remove_calls == 1
+    assert service._restart_failures["stuck"] == 1

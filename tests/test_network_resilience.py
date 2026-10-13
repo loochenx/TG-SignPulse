@@ -129,7 +129,7 @@ def _monitor_for_health_test(monkeypatch, client):
 
 def _health_client(get_me):
     return SimpleNamespace(
-        is_connected=True, _tg_signpulse_no_updates=False, get_me=get_me
+        is_connected=True, is_initialized=True, _tg_signpulse_no_updates=False, get_me=get_me
     )
 
 

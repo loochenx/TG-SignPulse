@@ -34,14 +34,19 @@ def test_secret_key_is_generated_once_and_private(tmp_path):
     assert first == second
     assert len(first) >= 32
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert [p.name for p in tmp_path.iterdir()] == [SECRET_KEY_FILENAME]
+    assert {p.name for p in tmp_path.iterdir()} == {
+        SECRET_KEY_FILENAME,
+        ".secret_key.lock",
+    }
 
 
 def test_secret_key_keeps_existing_file(tmp_path):
     from backend.core.config import SECRET_KEY_FILENAME, load_or_create_secret_key
 
-    (tmp_path / SECRET_KEY_FILENAME).write_text("existing-key\n", encoding="utf-8")
-    assert load_or_create_secret_key(tmp_path) == "existing-key"
+    (tmp_path / SECRET_KEY_FILENAME).write_text(
+        "existing-strong-key-for-test\n", encoding="utf-8"
+    )
+    assert load_or_create_secret_key(tmp_path) == "existing-strong-key-for-test"
 
 
 # ── 用户与认证接口 ──────────────────────────────────────────────────────────

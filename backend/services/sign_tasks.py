@@ -11,6 +11,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -19,11 +20,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-# 当前正在执行的签到任务所属账号。asyncio Task 各自持有独立的上下文副本，
-# 因此并发任务之间不会互相影响，是比 threading.local 更适合协程的隔离方式。
-_current_task_account: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "task_account", default=""
+# 当前正在执行的签到任务。run_id 用于拒收同一任务上一轮运行中迟到的后台回调。
+# asyncio Task 会复制当前上下文，因此下游协程和 SDK 回调通常能继承此身份。
+_current_task_run: contextvars.ContextVar[tuple[str, str, int] | None] = (
+    contextvars.ContextVar("sign_task_run", default=None)
 )
+
+_TASK_LOG_PREFIX_RE = re.compile(r"账户「(?P<account>.*?)」- 任务「(?P<task>.*?)」:")
 
 from backend.core.config import get_settings
 from backend.utils.account_locks import get_account_lock
@@ -74,9 +77,20 @@ class TaskLogHandler(logging.Handler):
     自定义日志处理器，将日志实时写入到内存 deque 中
     """
 
-    def __init__(self, log_deque: deque):
+    def __init__(
+        self,
+        log_deque: deque,
+        *,
+        account_name: str | None = None,
+        task_name: str | None = None,
+    ):
         super().__init__()
         self.log_list = log_deque
+        if account_name is not None and task_name is not None:
+            run_id = getattr(log_deque, "run_id", None)
+            if run_id is None:
+                raise ValueError("任务日志缓冲区缺少 run_id")
+            self.addFilter(_AccountTaskLogFilter(account_name, task_name, run_id))
 
     def emit(self, record):
         try:
@@ -86,25 +100,58 @@ class TaskLogHandler(logging.Handler):
 
 
 class _AccountTaskLogFilter(logging.Filter):
-    """只保留包含指定账号名的日志，防止并发任务日志交叉污染"""
+    """只保留指定账号、任务和本轮运行的日志。"""
 
-    def __init__(self, account_name: str):
+    def __init__(self, account_name: str, task_name: str, run_id: int):
         super().__init__()
-        self._account_name = account_name
+        self._task_run = (account_name, task_name, run_id)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        # 优先通过 ContextVar 判断：当前协程属于本账号任务，直接放行所有级别的日志
-        # （asyncio Task 各持独立上下文副本，并发任务不会互相干扰）
-        if _current_task_account.get("") == self._account_name:
+        explicit_run = getattr(record, "_sign_task_run", None)
+        if explicit_run is not None:
+            return explicit_run == self._task_run
+
+        current_run = _current_task_run.get()
+        prefix_match = _TASK_LOG_PREFIX_RE.search(record.getMessage())
+        target_task = self._task_run[:2]
+
+        if prefix_match is not None:
+            prefixed_task = (
+                prefix_match.group("account"),
+                prefix_match.group("task"),
+            )
+            if prefixed_task != target_task:
+                return False
+            # 同一任务上一轮运行创建的后台回调会保留旧 ContextVar；即使日志前缀
+            # 相同，也不能写入新一轮缓冲区。
+            if current_run is not None and current_run[:2] == target_task:
+                return current_run == self._task_run
+            # 某些 SDK 回调不会保留当前任务上下文，使用完整账号+任务前缀兜底。
             return True
-        # 兜底：消息中含账号前缀时同样放行（兼容旧路径）
-        return f"账户「{self._account_name}」" in record.getMessage()
+
+        # 无业务前缀的网络诊断只能依靠完整运行身份归属，避免同账号任务串台。
+        return current_run == self._task_run
 
 
 class BackendUserSigner(UserSigner):
     """
     后端专用的 UserSigner，适配后端目录结构并禁止交互式输入
     """
+
+    def __init__(self, *args, task_run_id: int | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._sign_task_run = (
+            (self._account, self.task_name, task_run_id)
+            if task_run_id is not None
+            else None
+        )
+
+    def log(self, msg, level: str = "INFO", **kwargs):
+        if self._sign_task_run is not None:
+            extra = dict(kwargs.pop("extra", None) or {})
+            extra["_sign_task_run"] = self._sign_task_run
+            kwargs["extra"] = extra
+        super().log(msg, level=level, **kwargs)
 
     @property
     def task_dir(self):
@@ -1826,13 +1873,18 @@ class SignTaskService:
             self._active_tasks[task_key] = True
             self._active_logs[task_key] = LogBuffer()
             self._last_run_results.pop(task_key, None)
-            log_handler = TaskLogHandler(self._active_logs[task_key])
+            log_handler = TaskLogHandler(
+                self._active_logs[task_key],
+                account_name=account_name,
+                task_name=task_name,
+            )
             log_handler.setLevel(logging.INFO)
             log_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
-            log_handler.addFilter(_AccountTaskLogFilter(account_name))
             tg_logger.addHandler(log_handler)
-            # 设置协程上下文：filter 通过 ContextVar 判断，无需依赖消息格式即可捕获所有日志
-            _cv_token = _current_task_account.set(account_name)
+            # 设置完整运行上下文：同账号的并发任务和同任务的相邻运行均可隔离。
+            _cv_token = _current_task_run.set(
+                (account_name, task_name, self._active_logs[task_key].run_id)
+            )
             task_cfg = self.get_task(task_name, account_name=account_name)
             if not task_cfg:
                 raise ValueError(f"Task {task_name} does not exist or cannot be loaded")
@@ -1949,6 +2001,7 @@ class SignTaskService:
                     # 注意: UserSigner 内部会使用 get_client 复用 client
                     signer = BackendUserSigner(
                         task_name=task_name,
+                        task_run_id=self._active_logs[task_key].run_id,
                         session_dir=str(session_dir),
                         account=account_name,
                         workdir=self.workdir,
@@ -2015,7 +2068,7 @@ class SignTaskService:
             if log_handler is not None:
                 tg_logger.removeHandler(log_handler)
             if _cv_token is not None:
-                _current_task_account.reset(_cv_token)
+                _current_task_run.reset(_cv_token)
 
             # 保存执行记录
             final_logs = list(self._active_logs.get(task_key, []))
@@ -2023,8 +2076,11 @@ class SignTaskService:
 
             last_reply = ""
             if success:
+                expected_task_prefix = (
+                    f"账户「{account_name}」- 任务「{task_name}」:"
+                )
                 for line in reversed(final_logs):
-                    if "收到来自「" in line and (
+                    if expected_task_prefix in line and "收到来自「" in line and (
                         "」的消息:" in line or "」对消息的更新，消息:" in line
                     ):
                         try:

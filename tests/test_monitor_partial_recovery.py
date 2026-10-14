@@ -22,9 +22,9 @@ class _Client:
         self.enter_calls = 0
         self.exit_calls = 0
 
-    def add_handler(self, _handler):
+    def add_handler(self, _handler, group=0):
         self.add_calls += 1
-        return (object(), 0)
+        return (object(), group)
 
     def remove_handler(self, *_handler_ref):
         self.remove_calls += 1
@@ -121,7 +121,11 @@ async def test_partial_start_retries_only_missing_account(monkeypatch, tmp_path)
         rules,
         {"missing": [failed, recovered]},
     )
-    healthy_ref = ("healthy", healthy, (object(), 0))
+    healthy_ref = (
+        "healthy",
+        healthy,
+        (object(), keyword_monitor.MONITOR_HANDLER_GROUP),
+    )
     service._handler_refs = [healthy_ref]
 
     await service.restart_from_tasks()
@@ -163,8 +167,16 @@ async def test_health_failure_rebuilds_only_unresponsive_account(
         rules,
         {"broken": [replacement]},
     )
-    healthy_ref = ("healthy", healthy, (object(), 0))
-    broken_ref = ("broken", broken, (object(), 0))
+    healthy_ref = (
+        "healthy",
+        healthy,
+        (object(), keyword_monitor.MONITOR_HANDLER_GROUP),
+    )
+    broken_ref = (
+        "broken",
+        broken,
+        (object(), keyword_monitor.MONITOR_HANDLER_GROUP),
+    )
     service._handler_refs = [healthy_ref, broken_ref]
     service._active_key = service._rules_key(rules)
     client_cache[str(tmp_path.joinpath("broken").resolve())] = broken
@@ -207,7 +219,13 @@ async def test_watchdog_backs_off_failed_start_without_disrupting_healthy_accoun
         {"missing": [_Client(start_error=OSError("offline")),
                      _Client(start_error=OSError("offline")), _Client()]},
     )
-    service._handler_refs = [("healthy", healthy, (object(), 0))]
+    service._handler_refs = [
+        (
+            "healthy",
+            healthy,
+            (object(), keyword_monitor.MONITOR_HANDLER_GROUP),
+        )
+    ]
     await service.restart_from_tasks()
     assert service._restart_retry_at["missing"] == 130.0
     await service._watchdog_tick()
@@ -259,7 +277,13 @@ async def test_connected_but_uninitialized_monitor_is_recreated(monkeypatch, tmp
     service, requested, close, cache = _prepare_service(
         monkeypatch, tmp_path, rules, {"broken": [replacement]},
     )
-    service._handler_refs = [("broken", broken, (object(), 0))]
+    service._handler_refs = [
+        (
+            "broken",
+            broken,
+            (object(), keyword_monitor.MONITOR_HANDLER_GROUP),
+        )
+    ]
     cache[str(tmp_path.joinpath("broken").resolve())] = broken
     assert not service._handlers_are_active_for(rules)
     await service._watchdog_tick()
@@ -290,7 +314,11 @@ async def test_monitor_start_has_deadline_and_preserves_healthy_listener(
     service, requested, _close, _cache = _prepare_service(
         monkeypatch, tmp_path, rules, {"stuck": [stuck]},
     )
-    healthy_ref = ("healthy", healthy, (object(), 0))
+    healthy_ref = (
+        "healthy",
+        healthy,
+        (object(), keyword_monitor.MONITOR_HANDLER_GROUP),
+    )
     service._handler_refs = [healthy_ref]
     await asyncio.wait_for(service.restart_from_tasks(), timeout=0.2)
     assert cancelled.is_set()

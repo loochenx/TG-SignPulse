@@ -1367,10 +1367,6 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
         self, num_of_dialogs=20, only_once: bool = False, force_rerun: bool = False
     ):
         self._refresh_retired_client()
-        if self.app.in_memory or self.app.session_string:
-            return await self.in_memory_run(
-                num_of_dialogs, only_once=only_once, force_rerun=force_rerun
-            )
         return await self.normal_run(
             num_of_dialogs, only_once=only_once, force_rerun=force_rerun
         )
@@ -1378,12 +1374,25 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
     async def in_memory_run(
         self, num_of_dialogs=20, only_once: bool = False, force_rerun: bool = False
     ):
-        async with self.app:
-            await self.normal_run(
-                num_of_dialogs, only_once=only_once, force_rerun=force_rerun
-            )
+        # Kept as a compatibility entry point for callers that explicitly use
+        # session-string mode.  All session modes now share the same managed
+        # client lifecycle in normal_run().
+        return await self.normal_run(
+            num_of_dialogs, only_once=only_once, force_rerun=force_rerun
+        )
 
     async def normal_run(
+        self, num_of_dialogs=20, only_once: bool = False, force_rerun: bool = False
+    ):
+        self._refresh_retired_client()
+        async with self.app:
+            return await self._normal_run(
+                num_of_dialogs,
+                only_once=only_once,
+                force_rerun=force_rerun,
+            )
+
+    async def _normal_run(
         self, num_of_dialogs=20, only_once: bool = False, force_rerun: bool = False
     ):
         if self.user is None:
@@ -1402,22 +1411,38 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
         edited_handler_ref = None
 
         async def sign_once():
-            success_count = 0
+            failures: list[tuple[object, Exception]] = []
             for chat in config.chats:
                 self.context.sign_chats[chat.chat_id].append(chat)
                 try:
                     await self.sign_a_chat(chat)
-                    success_count += 1
-                except errors.RPCError as _e:
-                    self.log(f"签到失败: {_e} \nchat: \n{chat}")
-                    logger.warning(_e, exc_info=True)
+                except Exception as exc:
+                    failures.append((chat, exc))
+                    self.log(f"签到失败: {exc} \nchat: \n{chat}")
+                    logger.warning(exc, exc_info=True)
                     continue
 
                 self.context.chat_messages[chat.chat_id].clear()
                 await asyncio.sleep(config.sign_interval)
 
-            if success_count == 0 and len(config.chats) > 0:
-                raise RuntimeError("所有会话均执行失败（详细请看运行日志）")
+            if failures:
+                details = "; ".join(
+                    f"chat_id={chat.chat_id}: {type(exc).__name__}: {exc}"
+                    for chat, exc in failures
+                )
+                first_error = failures[0][1]
+                message = (
+                    f"{len(failures)}/{len(config.chats)} 个会话执行失败: {details}"
+                )
+                # Preserve the existing transient-network contract: one-shot
+                # runs bubble OSError to the backend's bounded retry, while a
+                # long-running CLI retries after its existing cooldown.
+                network_error = next(
+                    (exc for _, exc in failures if isinstance(exc, OSError)), None
+                )
+                if network_error is not None:
+                    raise OSError(message) from network_error
+                raise RuntimeError(message) from first_error
 
             sign_record[str(now.date())] = now.isoformat()
             with open(self.sign_record_file, "w", encoding="utf-8") as fp:
@@ -1470,25 +1495,17 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
                         )
                     )
                 try:
-                    started_here = False
-                    if not getattr(self.app, "is_connected", False):
-                        await self.app.start()
-                        started_here = True
-                    try:
-                        now = get_now()
-                        self.log(f"当前时间: {now}")
-                        now_date_str = str(now.date())
-                        self.context = self.ensure_ctx()
-                        if need_sign(now_date_str):
-                            if only_once and config.random_seconds > 0:
-                                delay = random.randint(0, int(config.random_seconds))
-                                if delay > 0:
-                                    self.log(f"单次执行随机延迟: {delay} 秒")
-                                    await asyncio.sleep(delay)
-                            await sign_once()
-                    finally:
-                        if started_here:
-                            await self.app.stop()
+                    now = get_now()
+                    self.log(f"当前时间: {now}")
+                    now_date_str = str(now.date())
+                    self.context = self.ensure_ctx()
+                    if need_sign(now_date_str):
+                        if only_once and config.random_seconds > 0:
+                            delay = random.randint(0, int(config.random_seconds))
+                            if delay > 0:
+                                self.log(f"单次执行随机延迟: {delay} 秒")
+                                await asyncio.sleep(delay)
+                        await sign_once()
 
                 except OSError:
                     logger.exception("运行异常")

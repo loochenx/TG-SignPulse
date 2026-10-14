@@ -29,6 +29,7 @@ _MAX_CHANNEL_STATES = 512
 _SHORT_SLOT_RETRY = 0.25
 
 _update_rpc_active = 0
+_update_slot_leases: set[_UpdateSlotLease] = set()
 
 
 @dataclass
@@ -48,6 +49,24 @@ class _ShortSnapshot:
     latest_date: int
 
 
+@dataclass(eq=False)
+class _UpdateSlotLease:
+    channel_state: _ChannelState | None = None
+    released: bool = False
+
+    def release(self) -> None:
+        """Release this exact slot once, including after a reset generation."""
+        global _update_rpc_active
+        if self.released:
+            return
+        self.released = True
+        if self.channel_state is not None:
+            self.channel_state.in_flight = False
+            self.channel_state.last_seen = time.monotonic()
+        _update_slot_leases.discard(self)
+        _update_rpc_active = len(_update_slot_leases)
+
+
 @dataclass
 class _ClientState:
     channels: OrderedDict[int, _ChannelState] = field(default_factory=OrderedDict)
@@ -63,6 +82,10 @@ class _ClientState:
     )
     closed: bool = False
     active_tasks: set[asyncio.Task] = field(default_factory=set)
+    channel_tasks: set[asyncio.Task] = field(default_factory=set)
+    channel_leases: dict[asyncio.Task, _UpdateSlotLease] = field(
+        default_factory=dict
+    )
 
 
 _client_states: weakref.WeakKeyDictionary[Any, _ClientState] = (
@@ -100,17 +123,16 @@ def _cooldown(failures: int, exc: BaseException | None = None) -> float:
     return delay + random.uniform(0.0, 1.0)
 
 
-def _acquire_update_slot() -> bool:
+def _acquire_update_slot(
+    channel_state: _ChannelState | None = None,
+) -> _UpdateSlotLease | None:
     global _update_rpc_active
-    if _update_rpc_active >= _UPDATE_RPC_CONCURRENCY:
-        return False
-    _update_rpc_active += 1
-    return True
-
-
-def _release_update_slot() -> None:
-    global _update_rpc_active
-    _update_rpc_active = max(0, _update_rpc_active - 1)
+    if len(_update_slot_leases) >= _UPDATE_RPC_CONCURRENCY:
+        return None
+    lease = _UpdateSlotLease(channel_state=channel_state)
+    _update_slot_leases.add(lease)
+    _update_rpc_active = len(_update_slot_leases)
+    return lease
 
 
 def _channel_state(state: _ClientState, channel_id: int, now: float) -> _ChannelState:
@@ -153,18 +175,15 @@ async def _cached_channel_peer(client, channel_id: int):
     return await client.storage.get_peer_by_id(utils.get_channel_id(channel_id))
 
 
-async def _enrich_channel_update(client, update, users: dict, chats: dict) -> None:
+async def _enrich_channel_update(
+    client,
+    update,
+    users: dict,
+    chats: dict,
+    state: _ChannelState,
+    lease: _UpdateSlotLease,
+) -> None:
     channel_id = getattr(getattr(update.message, "peer_id", None), "channel_id", None)
-    if not channel_id:
-        return
-
-    client_state = _client_state(client)
-    now = time.monotonic()
-    state = _channel_state(client_state, int(channel_id), now)
-    if state.in_flight or now < state.retry_after or not _acquire_update_slot():
-        return
-
-    state.in_flight = True
     try:
         try:
             peer = await _cached_channel_peer(client, int(channel_id))
@@ -232,9 +251,69 @@ async def _enrich_channel_update(client, update, users: dict, chats: dict) -> No
             users.update({item.id: item for item in getattr(diff, "users", [])})
             chats.update({item.id: item for item in getattr(diff, "chats", [])})
     finally:
+        lease.release()
+
+
+def _channel_worker_done(
+    client_state: _ClientState,
+    lease: _UpdateSlotLease,
+    task: asyncio.Task,
+) -> None:
+    lease.release()
+    client_state.channel_tasks.discard(task)
+    client_state.channel_leases.pop(task, None)
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception:
+        logger.exception("Channel update enrichment worker crashed")
+
+
+def _schedule_channel_enrichment(client, update, users: dict, chats: dict) -> None:
+    """Start at most one bounded enrichment task for this channel.
+
+    The current raw update is already parseable and queued by the caller.  Use
+    private peer dictionaries here so a late RPC cannot mutate the packet while
+    the dispatcher is parsing it; ``Client.invoke`` still persists returned
+    peers for later updates.
+    """
+    client_state = _client_state(client)
+    if client_state.closed:
+        return
+    channel_id = getattr(getattr(update.message, "peer_id", None), "channel_id", None)
+    if not channel_id:
+        return
+
+    now = time.monotonic()
+    state = _channel_state(client_state, int(channel_id), now)
+    if state.in_flight or now < state.retry_after:
+        return
+    lease = _acquire_update_slot(state)
+    if lease is None:
+        return
+
+    state.in_flight = True
+    try:
+        task = client.loop.create_task(
+            _enrich_channel_update(
+                client,
+                update,
+                dict(users),
+                dict(chats),
+                state,
+                lease,
+            )
+        )
+    except BaseException:
         state.in_flight = False
-        state.last_seen = time.monotonic()
-        _release_update_slot()
+        lease.release()
+        raise
+    client_state.channel_tasks.add(task)
+    client_state.channel_leases[task] = lease
+    task.add_done_callback(
+        lambda completed: _channel_worker_done(client_state, lease, completed)
+    )
 
 
 async def _fetch_packet_peers(client, updates) -> bool:
@@ -305,21 +384,25 @@ async def _handle_full_updates(client, updates) -> None:
         if isinstance(update, raw.types.UpdateChannelTooLong):
             logger.info(update)
 
+        # Accept the message before advancing the persisted cursor. Queue.put_nowait
+        # is atomic and the SDK dispatcher queue is intentionally unbounded.
+        _queue_update(client, update, users, chats)
         if (
             isinstance(update, raw.types.UpdateNewChannelMessage)
             and is_min
             and not isinstance(update.message, raw.types.MessageEmpty)
         ):
-            await _enrich_channel_update(client, update, users, chats)
+            _schedule_channel_enrichment(client, update, users, chats)
 
-        # Accept the message before advancing the persisted cursor. Queue.put_nowait
-        # is atomic and the SDK dispatcher queue is intentionally unbounded.
-        _queue_update(client, update, users, chats)
         client_state = _client_state(client)
-        unresolved_global_gap = (
-            client_state.short_pending is not None
-            or client_state.short_in_flight is not None
-        )
+        unresolved_global_gap = False
+        if pts and channel_id is None:
+            unresolved_global_gap = await _extend_unresolved_global_gap(
+                client_state,
+                int(pts),
+                int(getattr(update, "pts_count", 0) or 0),
+                int(updates.date),
+            )
         if (
             pts
             and not client.skip_updates
@@ -380,6 +463,28 @@ def _take_short(state: _ClientState) -> _ShortSnapshot | None:
 
 def _put_short(state: _ClientState, snapshot: _ShortSnapshot) -> None:
     state.short_pending = _merge_short(state.short_pending, snapshot)
+
+
+async def _extend_unresolved_global_gap(
+    state: _ClientState,
+    pts: int,
+    pts_count: int,
+    date: int,
+) -> bool:
+    """Include a concurrent full update in an already-running global recovery."""
+    async with state.baseline_lock:
+        if state.short_pending is None and state.short_in_flight is None:
+            return False
+        _put_short(
+            state,
+            _ShortSnapshot(
+                pts=pts - max(pts_count, 0),
+                date=date,
+                latest_pts=pts,
+                latest_date=date,
+            ),
+        )
+        return True
 
 
 async def _global_storage_state(client):
@@ -542,7 +647,8 @@ async def _short_worker(client, state: _ClientState) -> None:
                     )
                     state.short_log_after = time.monotonic() + 60.0
                 continue
-            if not _acquire_update_slot():
+            lease = _acquire_update_slot()
+            if lease is None:
                 await asyncio.sleep(_SHORT_SLOT_RETRY)
                 continue
 
@@ -552,10 +658,10 @@ async def _short_worker(client, state: _ClientState) -> None:
                     if snapshot is not None:
                         state.short_in_flight = snapshot
             except BaseException:
-                _release_update_slot()
+                lease.release()
                 raise
             if snapshot is None:
-                _release_update_slot()
+                lease.release()
                 continue
 
             try:
@@ -589,7 +695,7 @@ async def _short_worker(client, state: _ClientState) -> None:
                     state.short_log_after = time.monotonic() + 60.0
                 continue
             finally:
-                _release_update_slot()
+                lease.release()
 
             if isinstance(
                 diff,
@@ -642,7 +748,8 @@ async def _short_worker(client, state: _ClientState) -> None:
                         state.short_pending.pts = response_state.pts
                         state.short_pending.date = response_state.date
 
-                if isinstance(diff, raw.types.updates.DifferenceSlice):
+                needs_follow_up = response_state.pts < snapshot.latest_pts
+                if isinstance(diff, raw.types.updates.DifferenceSlice) or needs_follow_up:
                     _put_short(
                         state,
                         _ShortSnapshot(
@@ -651,6 +758,14 @@ async def _short_worker(client, state: _ClientState) -> None:
                             max(snapshot.latest_pts, response_state.pts),
                             max(snapshot.latest_date, response_state.date),
                         ),
+                    )
+                if needs_follow_up and response_state.pts <= snapshot.pts:
+                    # A final Difference can transiently lag behind a full packet
+                    # already delivered on another Session task. Keep the target,
+                    # but avoid spinning if Telegram confirms no forward progress.
+                    state.short_failures = min(state.short_failures + 1, 8)
+                    state.short_retry_after = time.monotonic() + _cooldown(
+                        state.short_failures
                     )
                 continue
 
@@ -846,6 +961,7 @@ async def close_update_guard(client) -> None:
     state.closed = True
     current = asyncio.current_task()
     tasks = [task for task in state.active_tasks if task is not current]
+    tasks.extend(task for task in state.channel_tasks if task is not current)
     if state.short_worker is not None and state.short_worker is not current:
         tasks.append(state.short_worker)
     unique_tasks = list(dict.fromkeys(tasks))
@@ -854,7 +970,11 @@ async def close_update_guard(client) -> None:
             task.cancel()
     if unique_tasks:
         await asyncio.gather(*unique_tasks, return_exceptions=True)
+    for lease in list(state.channel_leases.values()):
+        lease.release()
     state.active_tasks.clear()
+    state.channel_tasks.clear()
+    state.channel_leases.clear()
     state.short_worker = None
     try:
         await _persist_unresolved_baseline(client, state)
@@ -870,9 +990,14 @@ async def close_update_guard(client) -> None:
 
 def reset_update_guard_state() -> None:
     """Cancel guard-owned workers and clear bounded state (test helper)."""
-    global _update_rpc_active
     for state in list(_client_states.values()):
         if state.short_worker is not None and not state.short_worker.done():
             state.short_worker.cancel()
+        for task in state.channel_tasks:
+            if not task.done():
+                task.cancel()
+        for lease in list(state.channel_leases.values()):
+            lease.release()
+    for lease in list(_update_slot_leases):
+        lease.release()
     _client_states.clear()
-    _update_rpc_active = 0

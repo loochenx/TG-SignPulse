@@ -34,6 +34,7 @@ MONITOR_HEALTH_TIMEOUT = 8.0
 MONITOR_START_TIMEOUT = 30.0
 MONITOR_RESTART_BASE_DELAY = 30.0
 MONITOR_RESTART_MAX_DELAY = 300.0
+MONITOR_HANDLER_GROUP = 10
 
 
 def _is_callback_data_invalid(exc: BaseException) -> bool:
@@ -1576,7 +1577,8 @@ class KeywordMonitorService:
                         MessageHandler(
                             handler,
                             filters.chat(chat_ids) & (filters.text | filters.caption),
-                        )
+                        ),
+                        group=MONITOR_HANDLER_GROUP,
                     )
                     try:
                         await asyncio.wait_for(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import secrets
@@ -16,34 +17,50 @@ except ImportError:
 
 
 SECRET_KEY_FILENAME = ".secret_key"
+MIN_SECRET_KEY_LENGTH = 16
 
 logger = logging.getLogger("backend.config")
 
 
 def load_or_create_secret_key(base_dir: Path) -> str:
-    """未设置 APP_SECRET_KEY 时，在数据目录生成随机密钥并持久化（权限 0600）"""
+    """读取持久密钥；缺失或过短时安全生成，进程间共享同一结果。"""
     path = base_dir / SECRET_KEY_FILENAME
-    try:
-        existing = path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        existing = ""
-    if existing:
+
+    def read_existing() -> str:
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return ""
+
+    existing = read_existing()
+    if len(existing) >= MIN_SECRET_KEY_LENGTH:
+        path.chmod(0o600)
         return existing
 
-    key = secrets.token_urlsafe(48)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".secret_key.")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fp:
-            fp.write(key)
-        # link 不覆盖已有文件：多个进程同时启动时只有一个写入成功，其余读取它的值
-        os.link(tmp, path)
-    except FileExistsError:
-        return path.read_text(encoding="utf-8").strip()
-    finally:
-        os.unlink(tmp)
+    # 锁单独的稳定文件：替换密钥文件后，并发启动进程仍锁同一 inode。
+    lock_fd = os.open(path.with_name(".secret_key.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(lock_fd, "a") as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        existing = read_existing()
+        if len(existing) >= MIN_SECRET_KEY_LENGTH:
+            path.chmod(0o600)
+            return existing
+
+        key = secrets.token_urlsafe(48)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".secret_key.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fp:
+                fp.write(key)
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(tmp, path)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+
     logger.warning(
-        "APP_SECRET_KEY 未设置，已生成随机密钥并保存到 %s；删除该文件会使所有登录失效",
+        "已生成随机登录密钥并保存到 %s；替换旧密钥后需重新登录面板",
         path,
     )
     return key
@@ -96,8 +113,8 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     settings = Settings()
     settings.secret_key = settings.secret_key.strip()
-    if not settings.secret_key:
+    if len(settings.secret_key) < MIN_SECRET_KEY_LENGTH:
+        if settings.secret_key:
+            logger.warning("APP_SECRET_KEY 过短，改用数据目录中的随机登录密钥")
         settings.secret_key = load_or_create_secret_key(settings.resolve_base_dir())
-    elif len(settings.secret_key) < 16:
-        logger.warning("APP_SECRET_KEY 过短（少于 16 个字符），建议换成随机长字符串")
     return settings

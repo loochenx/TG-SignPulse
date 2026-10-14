@@ -14,6 +14,13 @@ async def test_one_shot_signer_propagates_network_error_instead_of_looping():
     class FailingApp:
         is_connected = False
 
+        async def __aenter__(self):
+            await self.start()
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
         async def start(self):
             raise OSError("simulated network failure")
 
@@ -30,6 +37,7 @@ async def test_one_shot_signer_propagates_network_error_instead_of_looping():
     )
     signer.load_sign_record = dict
     signer._validate_sign_at = lambda value: value
+    signer._refresh_retired_client = lambda: None
     signer.log = lambda *args, **kwargs: None
 
     with pytest.raises(OSError, match="simulated network failure"):
